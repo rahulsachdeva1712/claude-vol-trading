@@ -15,7 +15,7 @@ REM ---- Python selection (>= 3.11, newest first) -----------------------
 set "PY="
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (
-    for %%V in (3.13 3.12 3.11) do (
+    for %%V in (3.14 3.13 3.12 3.11) do (
         if not defined PY (
             py -%%V -c "import sys" >nul 2>&1
             if !ERRORLEVEL!==0 set "PY=py -%%V"
