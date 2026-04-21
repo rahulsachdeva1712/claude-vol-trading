@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>volscalp — dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <header>
+    <h1>volscalp <small>Repeated OTM Strangle</small></h1>
+    <div class="controls">
+      <span class="pill" id="mode-pill">—</span>
+      <label>Mode:
+        <select id="mode-select">
+          <option value="paper">Paper</option>
+          <option value="live">Live</option>
+        </select>
+      </label>
+      <label>Lots/trade:
+        <input id="lots-input" type="number" min="1" max="100" value="1" />
+      </label>
+      <button id="apply-config">Apply</button>
+      <button id="kill-switch" class="danger">Kill switch</button>
+      <span id="conn" class="pill">WS: connecting…</span>
+    </div>
+  </header>
+
+  <section class="kpis" id="kpis">
+    <!-- filled by JS -->
+  </section>
+
+  <section class="grid">
+    <article class="card">
+      <h2>NIFTY — cycle</h2>
+      <div id="cycle-NIFTY" class="cycle-panel"></div>
+    </article>
+    <article class="card">
+      <h2>BANKNIFTY — cycle</h2>
+      <div id="cycle-BANKNIFTY" class="cycle-panel"></div>
+    </article>
+  </section>
+
+  <section class="card">
+    <h2>P&amp;L curve (cycle-by-cycle)</h2>
+    <canvas id="pnl-chart" height="120"></canvas>
+  </section>
+
+  <section class="card">
+    <h2>Closed trades (today)</h2>
+    <table id="trades">
+      <thead>
+        <tr>
+          <th>#</th><th>Underlying</th><th>Start</th><th>End</th>
+          <th>Reason</th><th>Peak</th><th>Trough</th><th>P&amp;L</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <footer>
+    <small>Internal dashboard — 127.0.0.1 only. Rotate Dhan credentials regularly.</small>
+  </footer>
+</body>
+</html>
