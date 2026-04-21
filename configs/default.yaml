@@ -1,0 +1,79 @@
+# volscalp default configuration
+# Numeric thresholds may be overridden from the dashboard UI at runtime.
+
+mode: paper                    # paper | live  (UI toggle wins at runtime)
+indices: [NIFTY, BANKNIFTY]
+expiry: monthly                # monthly only (per FRD)
+
+session:
+  timezone: Asia/Kolkata
+  start: "09:30"
+  end:   "15:15"
+  warmup_from: "09:15"         # engine initialises & builds ATM before start
+
+engine:
+  cooldown_minutes: 0
+  momentum_threshold_pct: 1.0
+  strike_offset_ce: 6
+  strike_offset_pe: -6
+  base_leg_sl_pct: 15.0
+  lazy_leg_sl_pct: 12.0
+  lazy_enabled: true
+  entry_price_source: close    # close | next_open
+  sl_price_source: close       # close | low (intrabar)
+  lots_per_trade: 1
+  max_concurrent_cycles: 2     # 1 per index max
+
+mtm_profiles:
+  NIFTY:
+    profile: protective
+    max_loss:       2500
+    target:          300
+    lock_activation: 400
+    lock_floor:      250
+    trail_step:        1
+  BANKNIFTY:
+    profile: tight
+    max_loss:       3500
+    target:          300
+    lock_activation: 500
+    lock_floor:      350
+    trail_step:        1
+
+instruments:
+  # Dhan uses SecurityId + ExchangeSegment. These are populated from the
+  # instrument master at startup — only configure overrides here.
+  NIFTY:
+    underlying_symbol: "NIFTY"
+    strike_interval: 50
+    lot_size: 75            # NSE NIFTY options (update if exchange changes)
+  BANKNIFTY:
+    underlying_symbol: "BANKNIFTY"
+    strike_interval: 100
+    lot_size: 35           # NSE BANKNIFTY options (update if exchange changes)
+
+broker:
+  name: dhan
+  feed_mode: quote         # quote | ticker | depth_20
+  ws_reconnect_backoff_s: [1, 2, 4, 8, 16, 30]
+  reconcile_interval_s: 1  # Dhan positions poll cadence (live mode)
+  order_timeout_s: 5
+
+paper:
+  fill_source: ltp         # ltp | best_bid_ask
+  slippage_bps: 0
+
+dashboard:
+  host: 127.0.0.1
+  port: 8765
+  kill_switch_require_confirm: true
+  live_mode_require_confirm: true
+
+persistence:
+  sqlite_path: data/volscalp.db
+  bar_snapshots_enabled: true
+
+logging:
+  level: INFO
+  json: true
+  path: logs/volscalp.log
