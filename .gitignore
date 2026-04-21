@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data / runtime
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.duckdb
+run/
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
