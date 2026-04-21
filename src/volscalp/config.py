@@ -99,7 +99,7 @@ class PersistenceConfig(BaseModel):
 
 class LoggingConfig(BaseModel):
     level: str = "INFO"
-    json: bool = True
+    json_output: bool = True
     path: str | None = "logs/volscalp.log"
 
 

@@ -172,6 +172,9 @@ class Leg:
     entry_order_id: str = ""
     exit_order_id: str = ""
 
+    # Bookkeeping row ID from the `legs` SQLite table (0 until inserted).
+    row_id: int = 0
+
     @property
     def quantity(self) -> int:
         return self.lots * self.lot_size

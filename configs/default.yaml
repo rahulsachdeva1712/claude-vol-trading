@@ -75,5 +75,5 @@ persistence:
 
 logging:
   level: INFO
-  json: true
+  json_output: true
   path: logs/volscalp.log
