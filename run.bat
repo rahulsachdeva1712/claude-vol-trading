@@ -1,6 +1,7 @@
 @echo off
 REM ============================================================
 REM  volscalp one-click launcher (Windows)
+REM  - picks the newest Python >= 3.11 available via py launcher
 REM  - creates .venv on first run
 REM  - installs/updates the package in editable mode
 REM  - launches the app against configs/default.yaml
@@ -10,19 +11,35 @@ REM ============================================================
 setlocal ENABLEDELAYEDEXPANSION
 cd /d "%~dp0"
 
-REM ---- Python check ----------------------------------------------------
+REM ---- Python selection (>= 3.11, newest first) -----------------------
+set "PY="
 where py >nul 2>&1
 if %ERRORLEVEL%==0 (
-    set "PY=py -3.11"
-) else (
-    where python >nul 2>&1
-    if %ERRORLEVEL% NEQ 0 (
-        echo [volscalp] Python 3.11 not found on PATH. Install from https://www.python.org/downloads/
-        pause
-        exit /b 1
+    for %%V in (3.13 3.12 3.11) do (
+        if not defined PY (
+            py -%%V -c "import sys" >nul 2>&1
+            if !ERRORLEVEL!==0 set "PY=py -%%V"
+        )
     )
-    set "PY=python"
 )
+
+if not defined PY (
+    where python >nul 2>&1
+    if %ERRORLEVEL%==0 (
+        for /f "delims=" %%V in ('python -c "import sys; print(1 if sys.version_info[:2] >= (3,11) else 0)" 2^>nul') do set "PYOK=%%V"
+        if "!PYOK!"=="1" set "PY=python"
+    )
+)
+
+if not defined PY (
+    echo [volscalp] No Python ^>=3.11 found.
+    echo [volscalp] Install Python 3.11 from https://www.python.org/downloads/release/python-3119/
+    echo [volscalp] ^(check "Add python.exe to PATH" during install^)
+    pause
+    exit /b 1
+)
+
+echo [volscalp] Using interpreter: %PY%
 
 REM ---- venv bootstrap --------------------------------------------------
 if not exist ".venv\Scripts\python.exe" (
