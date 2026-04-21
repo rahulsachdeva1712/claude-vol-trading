@@ -83,8 +83,8 @@ class StrategyEngine:
         self._mtm_ctrl: MtmController | None = None
         self._stop = asyncio.Event()
 
-        md.on_bar_close(self._on_bar_close)
-        md.on_tick(self._on_tick)
+        self.md.on_bar_close(self._on_bar_close)
+        self.md.on_tick(self._on_tick)
 
     # ---- lifecycle ---------------------------------------------------------
 
