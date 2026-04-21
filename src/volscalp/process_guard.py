@@ -94,7 +94,7 @@ def cleanup_stale_processes(pid_file: Path) -> int:
     """Kill any previous volscalp instances. Returns count of processes killed."""
     killed = 0
     safe_pids = _self_tree_pids()
-    log.debug("stale_scan_safe_pids", pids=sorted(safe_pids), self=os.getpid())
+    log.debug("stale_scan_safe_pids", pids=sorted(safe_pids), self_pid=os.getpid())
 
     # 1. PID file check.
     if pid_file.exists():
