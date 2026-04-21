@@ -21,11 +21,13 @@ Strangle Strategy on NSE indices (NIFTY 50 and BANKNIFTY). It is the
 authoritative specification for the development team.
 
 ### 1.2 Scope
-- Strategy simulation (backtesting) on historical minute-bar data
 - Paper trading mode: live market feed, simulated execution, no real capital
 - Live trading mode: real order execution via broker API (Dhan)
 - Strategy configuration management
 - Per-cycle and per-session trade logging and P&L reporting
+
+> **Non-goals (v0.x)**: historical backtesting, multi-strategy hosting,
+> portfolio-level risk, execution algos beyond plain market orders.
 
 ### 1.3 Definitions
 - **ATM**: At-the-Money — the strike closest to the current underlying spot price.
@@ -261,9 +263,10 @@ Fields reset at each new cycle start:
 | M-11 | UI / Dashboard       | Real-time display of open positions, cycle MTM, session summary.             |
 
 ### 8.2 Operational Modes
-- **Backtest**: Run strategy on stored historical minute-bar data. Full cycle replay. Output: trade log + P&L summary.
 - **Paper**: Connect to live feed; simulate entries and exits without real orders. Mirror of live logic.
 - **Live**: Full live execution via Dhan broker API. All MTM, SL, and entry logic identical to paper mode.
+
+> Backtesting on historical data is explicitly out of scope (see §1.2).
 
 ---
 
@@ -286,11 +289,16 @@ Fields reset at each new cycle start:
 ### 9.2 MTM Profile Parameters
 | Parameter        | Protective (NIFTY) | Tight (BANKNIFTY) | Description            |
 |------------------|--------------------|-------------------|------------------------|
-| mtm_max_loss     | Rs.2500            | Rs.3500           | Max cycle loss         |
-| mtm_target       | Rs.300             | Rs.300            | Cycle profit target    |
-| lock_activation  | Rs.400             | Rs.500            | Lock trigger level     |
-| lock_floor       | Rs.250             | Rs.350            | Min profit after lock  |
-| trail_step       | Rs.1               | Rs.1              | Trail increment/bar    |
+| mtm_max_loss     | Rs.2500            | Rs.3500           | Max cycle loss                                   |
+| mtm_target       | Rs.400             | Rs.500            | Cycle profit target                              |
+| lock_activation  | Rs.300             | Rs.300            | Lock trigger level (must be < target)            |
+| lock_floor       | Rs.250             | Rs.200            | Min profit after lock (must be < lock_activation)|
+| trail_step       | Rs.1               | Rs.1              | Trail increment/bar                              |
+
+**Invariant**: `lock_floor < lock_activation < target`. The lock-and-trail arms at
+`lock_activation` (on the way up) so that if MTM retreats to `lock_floor` the
+cycle exits with guaranteed profit — this must fire *before* the absolute
+`target` take-profit, otherwise the trail mechanism is inert.
 
 ---
 
@@ -328,7 +336,7 @@ Fields reset at each new cycle start:
 ### 10.3 Configuration Panel
 - All parameters from Section 9 editable before session start
 - Index selector: NIFTY / BANKNIFTY / Both
-- Mode selector: Backtest / Paper / Live
+- Mode selector: Paper / Live
 - MTM profile selector: Protective / Tight / Custom
 - Save and load named configuration profiles
 
@@ -362,7 +370,7 @@ Fields reset at each new cycle start:
 
 ### 11.4 Auditability
 - Every entry and exit decision logs: timestamp, bar values used, condition evaluated, outcome.
-- Backtest and paper modes must produce identical logic traces — divergence is a bug.
+- Paper and live modes must produce identical logic traces (same inputs → same decisions) — divergence is a bug.
 
 ### 11.5 Security (Live Mode)
 - Dhan credentials never stored in plain text in the repo. Loaded from `.env` (gitignored) or OS keyring.
@@ -384,7 +392,7 @@ Fields reset at each new cycle start:
 1. **Daily maximum loss across all cycles?** — Manual override only. No hard daily stop by default.
 2. **Adaptive strike offset?** — No. Remain hard-coded at ±6.
 3. **Expiry?** — Monthly.
-4. **Slippage in backtest / paper?** — None. Market orders, LTP fills.
+4. **Slippage in paper?** — None. Market orders, LTP fills.
 5. **Brokerage / STT in P&L?** — No. Match with broker's own numbers.
 6. **Lazy leg target strike missing in chain?** — Order fails at broker; status reflected in the app UI.
 7. **Trail step cadence?** — As defined in the strategy (Rs.1 per improvement point).

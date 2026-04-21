@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     session_date    TEXT NOT NULL,          -- YYYY-MM-DD
     index_name      TEXT,                   -- NIFTY | BANKNIFTY | ALL
-    mode            TEXT NOT NULL,          -- paper | live | backtest
+    mode            TEXT NOT NULL,          -- paper | live
     started_at      TEXT NOT NULL,
     ended_at        TEXT,
     total_cycles    INTEGER DEFAULT 0,

@@ -126,8 +126,7 @@ Before running the first **live** session, verify each item:
 
 ## Known gaps (v0.1)
 
-- Backtest mode is scaffolded but not yet implemented; `mode: backtest` will fail to start.
-- Access-token auto-refresh via TOTP is not wired in; expiry requires a manual `.env` update.
+- Access-token refresh: no TOTP automation; paste a fresh Dhan token into `.env` daily before the session.
 - Reconciler compares `orderId` fields only; if Dhan starts returning `correlationId` in positions, add that key.
 - No daily loss circuit breaker (per FRD answer — manual override only).
 - UI is single-user (no auth) and intended for localhost.

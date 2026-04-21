@@ -28,16 +28,16 @@ mtm_profiles:
   NIFTY:
     profile: protective
     max_loss:       2500
-    target:          300
-    lock_activation: 400
+    target:          400
+    lock_activation: 300
     lock_floor:      250
     trail_step:        1
   BANKNIFTY:
     profile: tight
     max_loss:       3500
-    target:          300
-    lock_activation: 500
-    lock_floor:      350
+    target:          500
+    lock_activation: 300
+    lock_floor:      200
     trail_step:        1
 
 instruments:

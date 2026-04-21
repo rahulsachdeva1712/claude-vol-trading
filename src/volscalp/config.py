@@ -20,7 +20,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Mode(str, Enum):
     PAPER = "paper"
     LIVE = "live"
-    BACKTEST = "backtest"
 
 
 class IndexName(str, Enum):
