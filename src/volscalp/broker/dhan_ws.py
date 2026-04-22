@@ -60,6 +60,10 @@ REQ_SUBSCRIBE_QUOTE = 17
 REQ_SUBSCRIBE_DEPTH = 21
 REQ_UNSUBSCRIBE = 16
 
+# Dhan silently drops a subscribe frame if the InstrumentList is too large.
+# Their docs recommend <=100 per frame. Chunk conservatively.
+SUBSCRIBE_CHUNK_SIZE = 100
+
 
 def _subscribe_payload(request_code: int, instruments: list[tuple[str, int]]) -> str:
     """Build a subscribe JSON payload.
@@ -218,15 +222,7 @@ class DhanMarketFeed:
                     attempt = 0
                     log.info("dhan_ws_connected")
                     if self._subscriptions:
-                        payload = _subscribe_payload(self.request_code, list(self._subscriptions))
-                        await ws.send(payload)
-                        sample = list(self._subscriptions)[:3]
-                        log.info(
-                            "dhan_ws_subscribed",
-                            count=len(self._subscriptions),
-                            request_code=self.request_code,
-                            sample=sample,
-                        )
+                        await self._send_subscribe_chunks(ws, list(self._subscriptions), self.request_code)
                     else:
                         log.warning("dhan_ws_no_initial_subscriptions")
                     await self._pump(ws)
@@ -289,13 +285,40 @@ class DhanMarketFeed:
                 log.warning("dhan_ws_text_frame", text=str(msg)[:400])
 
     async def subscribe(self, instruments: Iterable[tuple[str, int]]) -> None:
-        new = set(instruments) - self._subscriptions
+        new = list(set(instruments) - self._subscriptions)
         self._subscriptions.update(instruments)
         if self._ws and new:
-            await self._ws.send(_subscribe_payload(self.request_code, list(new)))
+            await self._send_subscribe_chunks(self._ws, new, self.request_code)
 
     async def unsubscribe(self, instruments: Iterable[tuple[str, int]]) -> None:
-        drop = set(instruments) & self._subscriptions
+        drop = list(set(instruments) & self._subscriptions)
         self._subscriptions.difference_update(drop)
         if self._ws and drop:
-            await self._ws.send(_subscribe_payload(REQ_UNSUBSCRIBE, list(drop)))
+            await self._send_subscribe_chunks(self._ws, drop, REQ_UNSUBSCRIBE)
+
+    async def _send_subscribe_chunks(
+        self, ws: WebSocketClientProtocol,
+        instruments: list[tuple[str, int]], request_code: int,
+    ) -> None:
+        """Dhan silently drops subscribe frames with too many instruments.
+        Chunk every outgoing subscribe/unsubscribe by SUBSCRIBE_CHUNK_SIZE."""
+        total = len(instruments)
+        for i in range(0, total, SUBSCRIBE_CHUNK_SIZE):
+            chunk = instruments[i: i + SUBSCRIBE_CHUNK_SIZE]
+            await ws.send(_subscribe_payload(request_code, chunk))
+            log.info(
+                "dhan_ws_subscribe_chunk",
+                request_code=request_code,
+                chunk=i // SUBSCRIBE_CHUNK_SIZE + 1,
+                chunk_size=len(chunk),
+                total=total,
+                sample=chunk[:2],
+            )
+            # Tiny gap so consecutive frames don't coalesce in Dhan's ingress.
+            await asyncio.sleep(0.05)
+        log.info(
+            "dhan_ws_subscribe_complete",
+            request_code=request_code,
+            total=total,
+            chunks=(total + SUBSCRIBE_CHUNK_SIZE - 1) // SUBSCRIBE_CHUNK_SIZE,
+        )
