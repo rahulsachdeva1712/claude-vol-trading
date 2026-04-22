@@ -32,7 +32,7 @@ mtm_profiles:
     max_loss: 2500
     target:    300
   BANKNIFTY:
-    max_loss: 3500
+    max_loss: 2500
     target:    300
 
 instruments:

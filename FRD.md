@@ -74,7 +74,7 @@ risk controls.
 | Strike Offset PE       | ATM - 6          | ATM - 6          |
 | Momentum Threshold     | 1% per bar       | 1% per bar       |
 | Lazy Mode              | Enabled          | Enabled          |
-| MTM Risk Profile       | max_loss=Rs.2500, target=Rs.300 | max_loss=Rs.3500, target=Rs.300 |
+| MTM Risk Profile       | max_loss=Rs.2500, target=Rs.300 | max_loss=Rs.2500, target=Rs.300 |
 | Base Leg SL            | 15% below entry  | 15% below entry  |
 | Lazy Leg SL            | 12% below entry  | 12% below entry  |
 | Session Close          | 15:15            | 15:15            |
@@ -172,7 +172,7 @@ improvement at the horizons we trade). The cycle has two thresholds only:
 
 | Control  | Value    | Behaviour                                  |
 |----------|----------|--------------------------------------------|
-| Max Loss | Rs.3500  | Exit all legs when cycle MTM <= -Rs.3500   |
+| Max Loss | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500   |
 | Target   | Rs.300   | Exit all legs when cycle MTM >=  Rs.300    |
 
 ### 5.3 Session Close
@@ -315,7 +315,7 @@ intended — paper is an idealised twin, not a strict mirror.
 ### 9.2 MTM Profile Parameters
 | Parameter    | NIFTY    | BANKNIFTY | Description                              |
 |--------------|----------|-----------|------------------------------------------|
-| mtm_max_loss | Rs.2500  | Rs.3500   | Max cycle loss                           |
+| mtm_max_loss | Rs.2500  | Rs.2500   | Max cycle loss                           |
 | mtm_target   | Rs.300   | Rs.300    | Cycle profit target                      |
 
 Lock-and-trail fields (`lock_activation`, `lock_floor`, `trail_step`) were
