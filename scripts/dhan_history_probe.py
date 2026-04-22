@@ -95,7 +95,9 @@ async def _probe(client: httpx.AsyncClient, sec_id: int, segment: str,
 
 
 async def main() -> None:
-    load_dotenv()
+    # Resolve paths from the script's own location so CWD doesn't matter.
+    repo_root = Path(__file__).resolve().parent.parent
+    load_dotenv(repo_root / ".env")
     client_id = os.getenv("DHAN_CLIENT_ID", "")
     token = os.getenv("DHAN_ACCESS_TOKEN", "")
     if not client_id or not token:
@@ -103,13 +105,23 @@ async def main() -> None:
         return
 
     # Locate cached scrip master (today, then walk back a few days).
-    cache_dir = Path("data/instruments")
+    data_dir = Path(os.getenv("VOLSCALP_DATA_DIR", "./data"))
+    if not data_dir.is_absolute():
+        data_dir = repo_root / data_dir
+    cache_dir = data_dir / "instruments"
     csv_path: Path | None = None
     for back in range(0, 7):
         cand = cache_dir / f"scrip_master_{(date.today() - timedelta(days=back)).isoformat()}.csv"
         if cand.exists():
             csv_path = cand
             break
+    if csv_path is None:
+        # Fall back to any scrip_master_*.csv in the directory (most recent).
+        if cache_dir.exists():
+            candidates = sorted(cache_dir.glob("scrip_master_*.csv"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                csv_path = candidates[0]
     if csv_path is None:
         print(f"ERROR: no scrip master under {cache_dir}/. Start the app once to download it.")
         return
