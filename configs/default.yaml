@@ -1,7 +1,7 @@
 # volscalp default configuration
 # Numeric thresholds may be overridden from the dashboard UI at runtime.
 
-mode: paper                    # paper | live  (UI toggle wins at runtime)
+mode: paper                    # initial default; both paper + live always run
 indices: [NIFTY, BANKNIFTY]
 expiry: monthly                # monthly only (per FRD)
 
@@ -21,24 +21,19 @@ engine:
   lazy_enabled: true
   entry_price_source: close    # close | next_open
   sl_price_source: close       # close | low (intrabar)
-  lots_per_trade: 1
+  lots_per_trade_paper: 1      # per-mode lot size
+  lots_per_trade_live:  1
   max_concurrent_cycles: 2     # 1 per index max
 
+# Simple MTM: cycle exits on max_loss or target (lock-and-trail removed
+# after simulation showed no material benefit for the intended horizons).
 mtm_profiles:
   NIFTY:
-    profile: protective
-    max_loss:       2500
-    target:          400
-    lock_activation: 300
-    lock_floor:      250
-    trail_step:        1
+    max_loss: 2500
+    target:    300
   BANKNIFTY:
-    profile: tight
-    max_loss:       3500
-    target:          500
-    lock_activation: 300
-    lock_floor:      200
-    trail_step:        1
+    max_loss: 3500
+    target:    300
 
 instruments:
   # Dhan uses SecurityId + ExchangeSegment. These are populated from the

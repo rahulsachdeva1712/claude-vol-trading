@@ -38,7 +38,7 @@ authoritative specification for the development team.
 - **Cycle**: One complete entry-to-exit sequence from entry through MTM or SL close.
 - **MTM**: Mark-to-Market — real-time unrealised P&L for all open legs in the cycle.
 - **Leg SL**: Individual option leg stop-loss, calculated from leg entry price.
-- **Lock & Trail**: MTM profit locking mechanism — locks a floor once a threshold is crossed, then trails upward.
+- **Lock & Trail**: (removed) MTM profit locking mechanism — locked a floor once a threshold was crossed, then trailed upward. Deleted in the 4-engine cleanup (§5.2).
 - **Momentum Filter**: Minimum candle return required on the option's own bar before a leg entry is triggered.
 - **Bar**: One OHLCV candle on the options data feed; minimum engine granularity.
 
@@ -60,7 +60,7 @@ risk controls.
 | 1    | 09:15–09:29 | App initialises, loads config, establishes data feed, computes initial ATM. |
 | 2    | 09:30       | Cycle 1 starts. Begin watching ATM+6 CE and ATM-6 PE for momentum entry. |
 | 3    | Per bar     | Check entry condition for each unentered base leg. Enter on first qualifying bar. |
-| 4    | Per bar     | For entered legs: check leg SL. Check overall MTM target / max loss / lock-trail. |
+| 4    | Per bar     | For entered legs: check leg SL. Check cycle-level MTM target / max loss.          |
 | 5    | Base leg SL | Schedule lazy leg entry for opposite side if not yet opened in this cycle. |
 | 6    | Cycle exit  | Close all open legs. Record cycle P&L.                                 |
 | 7    | Next bar    | Start next cycle immediately (cooldown = 0 minutes).                   |
@@ -74,7 +74,7 @@ risk controls.
 | Strike Offset PE       | ATM - 6          | ATM - 6          |
 | Momentum Threshold     | 1% per bar       | 1% per bar       |
 | Lazy Mode              | Enabled          | Enabled          |
-| MTM Risk Profile       | Protective MTM   | Tight MTM        |
+| MTM Risk Profile       | max_loss=Rs.2500, target=Rs.300 | max_loss=Rs.3500, target=Rs.300 |
 | Base Leg SL            | 15% below entry  | 15% below entry  |
 | Lazy Leg SL            | 12% below entry  | 12% below entry  |
 | Session Close          | 15:15            | 15:15            |
@@ -157,25 +157,23 @@ Maximum 4 active legs at any point within a single cycle.
 ### 5.2 Strategy-Level MTM Controls
 MTM controls operate at the **cycle level** — they monitor the combined P&L of all open legs within the current cycle.
 
-**NIFTY — Protective MTM**
+Lock-and-trail was evaluated and removed (backtests showed no material
+improvement at the horizons we trade). The cycle has two thresholds only:
+`max_loss` (hard stop) and `target` (take-profit).
 
-| Control         | Value    | Behaviour                                            |
-|-----------------|----------|------------------------------------------------------|
-| Max Loss        | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500             |
-| Target          | Rs.300   | Exit all legs when cycle MTM >= Rs.300               |
-| Lock Activation | Rs.400   | Once MTM reaches Rs.400, lock floor at Rs.250        |
-| Lock Floor      | Rs.250   | Cycle exits with minimum Rs.250 once locked          |
-| Trail Step      | Rs.1     | Floor rises in Rs.1 steps as MTM improves            |
+**NIFTY**
 
-**BANKNIFTY — Tight MTM**
+| Control  | Value    | Behaviour                                  |
+|----------|----------|--------------------------------------------|
+| Max Loss | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500   |
+| Target   | Rs.300   | Exit all legs when cycle MTM >=  Rs.300    |
 
-| Control         | Value    | Behaviour                                            |
-|-----------------|----------|------------------------------------------------------|
-| Max Loss        | Rs.3500  | Exit all legs when cycle MTM <= -Rs.3500             |
-| Target          | Rs.300   | Exit all legs when cycle MTM >= Rs.300               |
-| Lock Activation | Rs.500   | Once MTM reaches Rs.500, lock floor at Rs.350        |
-| Lock Floor      | Rs.350   | Cycle exits with minimum Rs.350 once locked          |
-| Trail Step      | Rs.1     | Floor rises in Rs.1 steps as MTM improves            |
+**BANKNIFTY**
+
+| Control  | Value    | Behaviour                                  |
+|----------|----------|--------------------------------------------|
+| Max Loss | Rs.3500  | Exit all legs when cycle MTM <= -Rs.3500   |
+| Target   | Rs.300   | Exit all legs when cycle MTM >=  Rs.300    |
 
 ### 5.3 Session Close
 - At **15:15**, all open legs across all active cycles are forcibly closed at prevailing market price.
@@ -184,9 +182,9 @@ MTM controls operate at the **cycle level** — they monitor the combined P&L of
 
 ### 5.4 Exit Priority Order
 When multiple exit conditions could apply simultaneously, priority is:
-1. Session close at 15:15 (always overrides all others)
-2. Overall MTM max loss breached
-3. Lock & Trail floor breached (exit at floor)
+1. Kill switch (live only — disarms + flattens all live cycles)
+2. Session close at 15:15 (always overrides 3-5)
+3. Overall MTM max loss breached
 4. Overall MTM target reached
 5. Individual leg SL hit (exits only that leg, cycle continues)
 
@@ -197,7 +195,7 @@ When multiple exit conditions could apply simultaneously, priority is:
 ### 6.1 Repeat Wrapper Behaviour
 - After a cycle closes (any exit trigger), the engine immediately schedules the next cycle.
 - Cooldown = 0 minutes. Next cycle starts on the first available bar after the exit bar.
-- All cycle state (MTM accumulator, leg positions, lock/trail flags) is fully reset between cycles.
+- All cycle state (MTM accumulator, leg positions, lazy flags) is fully reset between cycles.
 - Session-level state (total session P&L, cycle counter) accumulates across all cycles.
 
 ### 6.2 Cycle State Machine
@@ -213,8 +211,6 @@ When multiple exit conditions could apply simultaneously, priority is:
 Fields reset at each new cycle start:
 - Cycle MTM accumulator -> 0
 - All 4 leg slot statuses -> EMPTY
-- Lock activated flag -> false
-- Lock floor value -> 0
 - Lazy leg scheduled flags -> false
 - Cycle entry timestamps -> null
 
@@ -255,16 +251,45 @@ Fields reset at each new cycle start:
 | M-03 | ATM Calculator       | Compute ATM and strike offsets from spot price on each bar.                  |
 | M-04 | Entry Engine         | Apply momentum filter; schedule and execute base and lazy leg entries.       |
 | M-05 | Position Manager     | Track all open legs, compute leg-level MTM, enforce leg SLs.                 |
-| M-06 | MTM Controller       | Evaluate cycle-level MTM; trigger exits on target/loss/lock-trail.           |
+| M-06 | MTM Controller       | Evaluate cycle-level MTM; trigger exits on max_loss or target.               |
 | M-07 | Cycle Manager        | Manage cycle state machine, reset between cycles, schedule next cycle.       |
 | M-08 | Order Manager        | Route buy/sell orders to broker API (live/paper); handle fills.              |
 | M-09 | Trade Logger         | Persist all session, cycle, leg, and bar snapshot data.                      |
 | M-10 | Report Engine        | Generate end-of-session and on-demand P&L reports and charts.                |
 | M-11 | UI / Dashboard       | Real-time display of open positions, cycle MTM, session summary.             |
 
-### 8.2 Operational Modes
-- **Paper**: Connect to live feed; simulate entries and exits without real orders. Mirror of live logic.
-- **Live**: Full live execution via Dhan broker API. All MTM, SL, and entry logic identical to paper mode.
+### 8.2 Operational Modes — Paper and Live run simultaneously
+Paper and live are **not** a toggle. Both run in the same process, on the
+same market feed, as independent engine trees:
+
+- **Paper**: Uses the live feed; fills are simulated at LTP. Always active;
+  no credentials needed beyond the Dhan market-data token. Paper signals
+  are evaluated every bar and paper cycles proceed regardless of live state.
+- **Live**: Uses the live feed; orders go to Dhan REST. Live engines
+  **start disarmed** — entries are suppressed until the user explicitly
+  clicks "Arm" on the live tab. An armed live engine behaves identically
+  to the paper engine except for order placement.
+
+**Engine count (per process):** one engine per `(mode, underlying)` pair.
+With the default config this is four engines:
+
+| id                  | mode  | underlying | OrderManager | Session  | Arm default | Kill switch   |
+|---------------------|-------|------------|--------------|----------|-------------|---------------|
+| paper-NIFTY         | paper | NIFTY      | Paper        | session A (paper) | always armed | none          |
+| paper-BANKNIFTY     | paper | BANKNIFTY  | Paper        | session A (paper) | always armed | none          |
+| live-NIFTY          | live  | NIFTY      | Live (Dhan)  | session B (live)  | disarmed     | live-only     |
+| live-BANKNIFTY      | live  | BANKNIFTY  | Live (Dhan)  | session B (live)  | disarmed     | live-only     |
+
+Shared: Dhan market feed, `MarketDataService`, instrument master, SQLite
+connection, event bus, dashboard.
+Per-engine: `Cycle`, cycle counter, realized/peak/trough P&L, session id,
+arm flag reference.
+Per-mode (tree): `OrderManager`, lot-size input, kill flag (live only),
+DB session row.
+
+Because fills can differ between paper (LTP) and live (Dhan execution),
+the two trees' cycles and P&L naturally diverge over time. This is
+intended — paper is an idealised twin, not a strict mirror.
 
 > Backtesting on historical data is explicitly out of scope (see §1.2).
 
@@ -273,45 +298,44 @@ Fields reset at each new cycle start:
 ## Section 9 — Configuration Parameters
 
 ### 9.1 Global Parameters
-| Parameter              | Default | Description                                   |
-|------------------------|---------|-----------------------------------------------|
-| session_start          | 09:30   | First cycle start time                        |
-| session_end            | 15:15   | Hard session close time                       |
-| cooldown_minutes       | 0       | Wait time between cycles (minutes)            |
-| base_leg_sl_pct        | 15%     | Base leg stop loss as % below entry           |
-| lazy_leg_sl_pct        | 12%     | Lazy leg stop loss as % below entry           |
-| momentum_threshold_pct | 1.0%    | Minimum option candle return for entry        |
-| strike_offset_ce       | +6      | CE strike offset from ATM                     |
-| strike_offset_pe       | -6      | PE strike offset from ATM                     |
-| lazy_enabled           | true    | Whether lazy leg feature is active            |
-| lots_per_trade         | 1       | Lots per leg (configurable from UI)           |
+| Parameter              | Default | Description                                           |
+|------------------------|---------|-------------------------------------------------------|
+| session_start          | 09:30   | First cycle start time                                |
+| session_end            | 15:15   | Hard session close time                               |
+| cooldown_minutes       | 0       | Wait time between cycles (minutes)                    |
+| base_leg_sl_pct        | 15%     | Base leg stop loss as % below entry                   |
+| lazy_leg_sl_pct        | 12%     | Lazy leg stop loss as % below entry                   |
+| momentum_threshold_pct | 1.0%    | Minimum option candle return for entry                |
+| strike_offset_ce       | +6      | CE strike offset from ATM                             |
+| strike_offset_pe       | -6      | PE strike offset from ATM                             |
+| lazy_enabled           | true    | Whether lazy leg feature is active                    |
+| lots_per_trade_paper   | 1       | Lots per leg — paper engines (UI-editable per mode)   |
+| lots_per_trade_live    | 1       | Lots per leg — live engines (UI-editable per mode)    |
 
 ### 9.2 MTM Profile Parameters
-| Parameter        | Protective (NIFTY) | Tight (BANKNIFTY) | Description            |
-|------------------|--------------------|-------------------|------------------------|
-| mtm_max_loss     | Rs.2500            | Rs.3500           | Max cycle loss                                   |
-| mtm_target       | Rs.400             | Rs.500            | Cycle profit target                              |
-| lock_activation  | Rs.300             | Rs.300            | Lock trigger level (must be < target)            |
-| lock_floor       | Rs.250             | Rs.200            | Min profit after lock (must be < lock_activation)|
-| trail_step       | Rs.1               | Rs.1              | Trail increment/bar                              |
+| Parameter    | NIFTY    | BANKNIFTY | Description                              |
+|--------------|----------|-----------|------------------------------------------|
+| mtm_max_loss | Rs.2500  | Rs.3500   | Max cycle loss                           |
+| mtm_target   | Rs.300   | Rs.300    | Cycle profit target                      |
 
-**Invariant**: `lock_floor < lock_activation < target`. The lock-and-trail arms at
-`lock_activation` (on the way up) so that if MTM retreats to `lock_floor` the
-cycle exits with guaranteed profit — this must fire *before* the absolute
-`target` take-profit, otherwise the trail mechanism is inert.
+Lock-and-trail fields (`lock_activation`, `lock_floor`, `trail_step`) were
+removed. See §5.2 for rationale. The `ExitReason.LOCK_TRAIL_FLOOR` enum
+value has been dropped accordingly.
 
 ---
 
 ## Section 10 — UI / Dashboard Requirements
 
 ### 10.1 Real-Time Dashboard
+The dashboard is split into two **tabs**: `Paper` and `Live`. Each tab
+shows its own engine tree — nothing bleeds across tabs.
+
+Both tabs display:
 - Current cycle number and state (WATCHING / ACTIVE / EXITING) — per index.
 - Live MTM for current cycle — colour-coded (green positive, red negative).
-- Lock & trail status: locked / not locked, current floor value.
 - Leg table: all 4 slots showing status (EMPTY / WATCHING / ACTIVE / STOPPED), strike, entry price, current price, P&L per leg.
-- Session summary: total cycles completed, session P&L, win/loss counts.
 - Underlying spot price and current ATM — updated on every tick.
-- KPI strip (required, visible at all times):
+- KPI strip (required, visible at all times) — mode-scoped:
   - Today MTM P&L
   - Today Realized P&L
   - Today Unrealized P&L
@@ -322,23 +346,30 @@ cycle exits with guaranteed profit — this must fire *before* the absolute
   - Average P&L per Closed Trade
   - Profit Factor
   - Max Drawdown
-- Controls (on the dashboard):
-  - **Mode toggle**: Paper / Live (Live requires explicit confirmation)
-  - **Kill switch**: one click halts all activity, force-closes all live positions, disables entries
-  - **Lots per trade** input
-  - **Start / Stop engine** buttons
+- Closed-trades table + cumulative P&L chart — scoped to the selected mode's session.
+
+Per-tab controls:
+- `Paper` tab:
+  - **Lots per trade** input (paper-only)
+- `Live` tab:
+  - **Arm / Disarm** toggle: live engines do not place entries until armed.
+  - **Kill switch**: disarms + force-closes every live cycle. Does not affect paper.
+  - **Clear kill**: resets the kill flag (manual review gate). Does not re-arm.
+  - **Lots per trade** input (live-only).
+
+The live tab's tab-chip pill renders one of `disarmed`, `armed`, `killed`,
+or `unavailable` (when Dhan credentials are absent).
 
 ### 10.2 Trade Log View
-- Filterable table of all completed cycles for the session
+- Per-mode filterable table of all completed cycles for the session
 - Columns: Cycle #, Start Time, Exit Time, Exit Reason, Legs Entered, Peak MTM, Cycle P&L
 - Expandable row to show individual leg detail
 
 ### 10.3 Configuration Panel
-- All parameters from Section 9 editable before session start
-- Index selector: NIFTY / BANKNIFTY / Both
-- Mode selector: Paper / Live
-- MTM profile selector: Protective / Tight / Custom
-- Save and load named configuration profiles
+- All parameters from Section 9 editable before session start (config file)
+- Runtime mutable from the dashboard: **lots_per_trade_paper**, **lots_per_trade_live** (per tab).
+- Mode is not a selector — both paper and live always run (live gated by Arm).
+- Index selector (config file only): NIFTY / BANKNIFTY / Both.
 
 ### 10.4 Report Screen
 - End-of-session P&L curve (cycle-by-cycle cumulative)
@@ -370,12 +401,19 @@ cycle exits with guaranteed profit — this must fire *before* the absolute
 
 ### 11.4 Auditability
 - Every entry and exit decision logs: timestamp, bar values used, condition evaluated, outcome.
-- Paper and live modes must produce identical logic traces (same inputs → same decisions) — divergence is a bug.
+- Paper and live decision paths are identical per engine class — the only
+  difference is which `OrderManager` backend receives the order. Signal
+  *decisions* therefore agree tick-for-tick; outcomes (fills, P&L, SL
+  times) diverge naturally based on execution reality.
+- Each mode has its own session row in SQLite (`sessions.mode = 'paper'|'live'`)
+  for clean audit isolation.
 
 ### 11.5 Security (Live Mode)
 - Dhan credentials never stored in plain text in the repo. Loaded from `.env` (gitignored) or OS keyring.
-- Live mode requires explicit user confirmation before session start.
-- Daily loss circuit breaker: configurable; halts all activity if session P&L crosses threshold.
+- Live mode requires explicit user confirmation via the **Arm** button
+  before any live entry is placed. Disarm / Kill are immediately effective.
+- Daily loss circuit breaker: not implemented by default (per §12.2 Q1);
+  the operator is expected to watch the dashboard and use Kill manually.
 - Only orders placed by this app are tracked by MTM; any manual Dhan trades outside the app are filtered out by order-id tagging.
 
 ---
@@ -395,18 +433,18 @@ cycle exits with guaranteed profit — this must fire *before* the absolute
 4. **Slippage in paper?** — None. Market orders, LTP fills.
 5. **Brokerage / STT in P&L?** — No. Match with broker's own numbers.
 6. **Lazy leg target strike missing in chain?** — Order fails at broker; status reflected in the app UI.
-7. **Trail step cadence?** — As defined in the strategy (Rs.1 per improvement point).
+7. **Lock-and-trail?** — Removed after backtesting; see §5.2.
 
 ### 12.3 Platform Decisions
 - **Broker**: Dhan (REST for orders + WebSocket for market data).
-- **Tech stack**: Python 3.11, uvloop, asyncio, FastAPI, SQLite, dhanhq SDK.
-- **Deployment**: VPS. Dashboard bound to `127.0.0.1` by default.
+- **Tech stack**: Python ≥3.11, uvloop (POSIX only), asyncio, FastAPI, SQLite, dhanhq SDK.
+- **Deployment**: VPS or developer workstation. Dashboard bound to `127.0.0.1` by default.
 - **Paper trading fills**: LTP (fallback to best bid/ask when available from 20-depth).
 - **Market data feed**: Dhan ticker / quote WebSocket. Upgradable to 20-depth if needed.
 - **Order type**: MARKET, intraday (MIS) only.
-- **Concurrency**: Max 2 active cycles (1 NIFTY + 1 BANKNIFTY). Each cycle can have up to 4 legs.
-- **Auto square-off**: 15:15 hard close.
-- **Process hygiene**: PID file + psutil check on startup; SIGINT/SIGTERM handlers for clean shutdown.
+- **Concurrency**: Four engines per process (paper×NIFTY, paper×BANKNIFTY, live×NIFTY, live×BANKNIFTY). Max one cycle per engine at any time → up to 4 concurrent cycles, each with up to 4 legs.
+- **Auto square-off**: 15:15 hard close (applies to both modes).
+- **Process hygiene**: PID file + psutil check on startup (skips self, ancestors, descendants to avoid killing the launcher on Windows). SIGINT/SIGTERM handlers for clean shutdown.
 
 ---
 

@@ -1,7 +1,10 @@
 """Strategy engine — Repeated OTM Strangle.
 
-One engine instance per underlying (NIFTY, BANKNIFTY). All engines run
-on the same asyncio loop and share the MarketDataService / OrderManager.
+One engine instance per (mode, underlying) pair. With paper and live both
+running simultaneously, that's four engines per process (paper-NIFTY,
+paper-BANKNIFTY, live-NIFTY, live-BANKNIFTY). They share the market-data
+service and instrument master; everything else — cycles, MTM, P&L,
+session id — is per-engine.
 
 Hot path:
     tick → update leg last_price → recompute cycle MTM → MtmController
@@ -19,7 +22,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from ..broker.instruments import InstrumentMaster
-from ..config import AppConfig, IndexName, MtmProfile
+from ..config import AppConfig, IndexName, Mode, MtmProfile
 from ..logging_setup import get_logger
 from ..market_data.feed import MarketDataService
 from ..models import (
@@ -43,31 +46,40 @@ log = get_logger(__name__)
 
 
 class StrategyEngine:
-    """One engine per underlying."""
+    """One engine per (mode, underlying)."""
 
     def __init__(
         self,
+        mode: Mode,
         underlying: IndexName,
         cfg: AppConfig,
         market_data: MarketDataService,
         instruments: InstrumentMaster,
         order_mgr: OrderManager,
         db: Database,
+        session_id: int,
         kill_switch: asyncio.Event,
+        armed: asyncio.Event,
         event_bus,   # EventBus - kept duck-typed to avoid import cycle
+        lots_provider,  # callable() -> int, read at cycle start
     ):
+        self.mode = mode
         self.underlying = underlying
         self.cfg = cfg
         self.md = market_data
         self.instruments = instruments
         self.orders = order_mgr
         self.db = db
+        self.session_id = session_id
         self.kill = kill_switch
+        self.armed = armed
         self.bus = event_bus
+        self._lots_provider = lots_provider
 
         self.profile: MtmProfile = cfg.mtm_profiles[underlying]
         self.inst_cfg = cfg.instruments[underlying]
         self.tz = ZoneInfo(cfg.session.timezone)
+        self.tag = f"{mode.value}:{underlying.value}"
 
         self.current_cycle: Cycle | None = None
         self.current_cycle_row_id: int | None = None
@@ -94,20 +106,25 @@ class StrategyEngine:
     async def run(self) -> None:
         """Engine driver — pumps the cycle state machine on a 1-second tick."""
         self.expiry = self.instruments.pick_expiry(self.underlying, self.cfg.expiry)
-        log.info("engine_started", underlying=self.underlying.value, expiry=self.expiry,
-                 profile=self.profile.profile)
+        log.info(
+            "engine_started",
+            tag=self.tag,
+            underlying=self.underlying.value,
+            mode=self.mode.value,
+            expiry=self.expiry,
+        )
 
         while not self._stop.is_set():
             try:
                 await self._tick_engine()
             except Exception as e:  # noqa: BLE001
-                log.exception("engine_tick_error", error=str(e))
+                log.exception("engine_tick_error", tag=self.tag, error=str(e))
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
-        log.info("engine_stopped", underlying=self.underlying.value)
+        log.info("engine_stopped", tag=self.tag, underlying=self.underlying.value)
 
     # ---- state machine -----------------------------------------------------
 
@@ -130,6 +147,13 @@ class StrategyEngine:
         if before_start:
             return  # warmup
 
+        # Live engines don't open new cycles until the user arms them from
+        # the dashboard. Already-open cycles continue to be managed (so
+        # disarming during a cycle does NOT halt MTM / SL evaluation — the
+        # kill switch is the escape hatch for that).
+        if not self.armed.is_set() and self.current_cycle is None:
+            return
+
         if self.current_cycle is None:
             await self._start_new_cycle()
             return
@@ -137,7 +161,7 @@ class StrategyEngine:
         # If the current cycle is fully closed, open the next (cooldown = 0).
         if self.current_cycle.state == CycleState.CLOSED:
             self.current_cycle = None
-            if not after_close:
+            if not after_close and self.armed.is_set():
                 await self._start_new_cycle()
 
     async def _start_new_cycle(self) -> None:
@@ -166,9 +190,10 @@ class StrategyEngine:
 
         self.current_cycle = cycle
         self._mtm_ctrl = MtmController(self.profile)
-        self.current_cycle_row_id = await self.db.insert_cycle(cycle)
+        self.current_cycle_row_id = await self.db.insert_cycle(self.session_id, cycle)
         log.info(
             "cycle_start",
+            tag=self.tag,
             cycle=cycle.cycle_id,
             underlying=cycle.underlying,
             spot=spot,
@@ -179,9 +204,9 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "atm": atm, "spot": spot,
-             "legs": self._legs_snapshot()},
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "atm": atm, "spot": spot, "legs": self._legs_snapshot()},
         )
 
         # Subscribe the MarketDataService's WS to the option instruments for this cycle.
@@ -195,7 +220,7 @@ class StrategyEngine:
             underlying=self.underlying.value,
             strike=strike,
             status=LegStatus.WATCHING,
-            lots=self.cfg.engine.lots_per_trade,
+            lots=max(1, int(self._lots_provider())),
             lot_size=self.inst_cfg.lot_size,
             expiry=self.expiry,
         )
@@ -248,6 +273,7 @@ class StrategyEngine:
                 await self._enter_leg(leg, bar)
             else:
                 await self.db.log_decision(
+                    self.session_id,
                     self.current_cycle_row_id,
                     "entry_eval",
                     {"slot": leg.slot, "ret_pct": round(bar.return_pct, 3)},
@@ -297,7 +323,7 @@ class StrategyEngine:
 
         if self.current_cycle_row_id is not None:
             leg.row_id = await self.db.insert_leg(self.current_cycle_row_id, leg)
-            await self.db.record_order_request(req, self.current_cycle_row_id, leg.row_id)
+            await self.db.record_order_request(self.session_id, req, self.current_cycle_row_id, leg.row_id)
 
         report = await self.orders.place(req)
         if report.status == "FILLED":
@@ -314,8 +340,9 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "leg_update",
-            {"underlying": self.underlying.value, "cycle": self.current_cycle.cycle_id,
-             "slot": leg.slot, "status": leg.status.value,
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": self.current_cycle.cycle_id, "slot": leg.slot,
+             "status": leg.status.value,
              "entry_price": leg.entry_price, "sl": leg.sl_price},
         )
 
@@ -353,6 +380,7 @@ class StrategyEngine:
 
         log.info(
             "leg_exit",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=self.current_cycle.cycle_id if self.current_cycle else None,
             slot=leg.slot,
@@ -362,7 +390,7 @@ class StrategyEngine:
         )
         await self.bus.broadcast(
             "leg_update",
-            {"underlying": self.underlying.value,
+            {"mode": self.mode.value, "underlying": self.underlying.value,
              "cycle": self.current_cycle.cycle_id if self.current_cycle else None,
              "slot": leg.slot, "status": leg.status.value,
              "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
@@ -409,6 +437,7 @@ class StrategyEngine:
         cycle.legs[slot] = leg
         log.info(
             "lazy_leg_scheduled",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=cycle.cycle_id,
             slot=slot,
@@ -433,10 +462,10 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "mtm": round(mtm, 2),
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "mtm": round(mtm, 2),
              "peak": round(cycle.peak_mtm, 2), "trough": round(cycle.trough_mtm, 2),
-             "locked": cycle.lock_activated, "floor": round(cycle.lock_floor, 2),
              "legs": self._legs_snapshot()},
         )
 
@@ -460,8 +489,6 @@ class StrategyEngine:
                 cycle.cycle_pnl,
                 cycle.peak_mtm,
                 cycle.trough_mtm,
-                cycle.lock_activated,
-                cycle.lock_floor,
             )
         self.closed_cycles_count += 1
         if cycle.cycle_pnl > 0:
@@ -475,6 +502,7 @@ class StrategyEngine:
 
         log.info(
             "cycle_closed",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=cycle.cycle_id,
             reason=reason.value,
@@ -484,9 +512,10 @@ class StrategyEngine:
         )
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "mtm": cycle.cycle_pnl,
-             "exit_reason": reason.value, "legs": self._legs_snapshot(), "closed": True},
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "mtm": cycle.cycle_pnl, "exit_reason": reason.value,
+             "legs": self._legs_snapshot(), "closed": True},
         )
 
     # ---- UI helpers --------------------------------------------------------
@@ -520,12 +549,12 @@ class StrategyEngine:
             unrealized = sum(leg.unrealized_pnl for leg in self.current_cycle.legs.values())
         total = self.realized_pnl + unrealized
         avg_closed = (self.realized_pnl / self.closed_cycles_count) if self.closed_cycles_count else 0.0
-        winners = [1 for _ in range(self.win_count)]
         total_trades = self.win_count + self.loss_count
         win_rate = (self.win_count / total_trades * 100.0) if total_trades else 0.0
         return {
             "underlying": self.underlying.value,
-            "mode": self.cfg.mode.value,
+            "mode": self.mode.value,
+            "armed": self.armed.is_set(),
             "cycle_no": self.cycle_counter,
             "closed_cycles": self.closed_cycles_count,
             "realized_pnl": round(self.realized_pnl, 2),

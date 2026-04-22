@@ -1,32 +1,33 @@
-// volscalp dashboard — vanilla JS, single file.
+// volscalp dashboard — vanilla JS. Paper + Live tabs, shared rendering.
 (function () {
   'use strict';
 
+  const MODES = ['paper', 'live'];
+  const UNDERLYINGS = ['NIFTY', 'BANKNIFTY'];
+
   const state = {
     snapshot: null,
-    chart: null,
-    chartData: { labels: [], datasets: [{ label: 'Cumulative P&L', data: [], tension: 0.25, fill: false, borderColor: '#5aa0ff' }] },
+    activeMode: 'paper',
+    charts: {},                 // mode -> Chart instance
+    chartData: {
+      paper: { labels: [], datasets: [{ label: 'Cumulative P&L (paper)', data: [], tension: 0.25, fill: false, borderColor: '#5aa0ff' }] },
+      live:  { labels: [], datasets: [{ label: 'Cumulative P&L (live)',  data: [], tension: 0.25, fill: false, borderColor: '#f2a83b' }] },
+    },
   };
 
   function $(id) { return document.getElementById(id); }
-
   function fmtPnl(v) {
     if (v === null || v === undefined) return '—';
     const n = Number(v);
     const sign = n > 0 ? '+' : '';
     return sign + n.toLocaleString('en-IN', { maximumFractionDigits: 2 });
   }
+  function cssPnl(v) { const n = Number(v); if (n > 0) return 'pos'; if (n < 0) return 'neg'; return ''; }
 
-  function cssPnl(v) {
-    const n = Number(v);
-    if (n > 0) return 'pos';
-    if (n < 0) return 'neg';
-    return '';
-  }
-
-  function renderKpis(snap) {
-    const agg = snap.aggregate || {};
-    const kpis = [
+  function renderKpis(mode, agg) {
+    const host = $('kpis-' + mode);
+    if (!host) return;
+    const items = [
       { label: 'Today MTM', value: fmtPnl(agg.total_mtm), cls: cssPnl(agg.total_mtm) },
       { label: 'Today Realized', value: fmtPnl(agg.realized_pnl), cls: cssPnl(agg.realized_pnl) },
       { label: 'Today Unrealized', value: fmtPnl(agg.unrealized_pnl), cls: cssPnl(agg.unrealized_pnl) },
@@ -38,14 +39,13 @@
       { label: 'Profit Factor', value: (agg.profit_factor ?? 0).toFixed(2), cls: '' },
       { label: 'Max Drawdown', value: fmtPnl(agg.max_drawdown), cls: 'neg' },
     ];
-    const html = kpis.map(k =>
+    host.innerHTML = items.map(k =>
       `<div class="kpi"><div class="label">${k.label}</div><div class="value ${k.cls}">${k.value}</div></div>`
     ).join('');
-    $('kpis').innerHTML = html;
   }
 
-  function renderCycle(underlying, engine) {
-    const el = $('cycle-' + underlying);
+  function renderCycle(mode, underlying, engine) {
+    const el = $('cycle-' + mode + '-' + underlying);
     if (!el) return;
     if (!engine) { el.innerHTML = '<em>no data</em>'; return; }
     const mtm = Number(engine.mtm ?? 0);
@@ -66,7 +66,6 @@
         <div>
           <div><b>Cycle ${engine.cycle_no ?? '—'}</b> · state: ${engine.state ?? '—'}</div>
           <div>ATM: ${engine.atm ?? '—'} · Spot: ${engine.spot ? Number(engine.spot).toFixed(2) : '—'}</div>
-          <div>Lock: ${engine.locked ? 'YES @ ' + Number(engine.floor).toFixed(2) : 'no'}</div>
         </div>
         <div class="mtm ${mtmCls}">${fmtPnl(mtm)}</div>
       </div>
@@ -77,37 +76,39 @@
     `;
   }
 
-  function renderTrades(trades) {
-    const tbody = document.querySelector('#trades tbody');
+  function renderTrades(mode, trades) {
+    const tbody = document.querySelector('#trades-' + mode + ' tbody');
     if (!tbody) return;
-    if (!trades || !trades.length) { tbody.innerHTML = '<tr><td colspan="8"><em>no closed trades yet</em></td></tr>'; return; }
+    if (!trades || !trades.length) {
+      tbody.innerHTML = '<tr><td colspan="8"><em>no closed trades yet</em></td></tr>';
+      return;
+    }
     tbody.innerHTML = trades.map(t =>
       `<tr>
-        <td>${t.cycle_no}</td>
-        <td>${t.underlying}</td>
-        <td>${t.started_at ?? ''}</td>
-        <td>${t.ended_at ?? ''}</td>
+        <td>${t.cycle_no}</td><td>${t.underlying}</td>
+        <td>${t.started_at ?? ''}</td><td>${t.ended_at ?? ''}</td>
         <td>${t.exit_reason ?? ''}</td>
-        <td>${fmtPnl(t.peak_mtm)}</td>
-        <td>${fmtPnl(t.trough_mtm)}</td>
+        <td>${fmtPnl(t.peak_mtm)}</td><td>${fmtPnl(t.trough_mtm)}</td>
         <td class="${cssPnl(t.cycle_pnl)}">${fmtPnl(t.cycle_pnl)}</td>
       </tr>`
     ).join('');
   }
 
-  function renderPnlChart(trades) {
-    const ctx = $('pnl-chart').getContext('2d');
+  function renderPnlChart(mode, trades) {
+    const ctx = $('pnl-chart-' + mode);
+    if (!ctx) return;
+    const ctx2 = ctx.getContext('2d');
     const sorted = (trades || []).slice().reverse();
     const labels = sorted.map(t => '#' + t.cycle_no);
     let cum = 0;
     const data = sorted.map(t => { cum += Number(t.cycle_pnl) || 0; return cum; });
-    state.chartData.labels = labels;
-    state.chartData.datasets[0].data = data;
+    state.chartData[mode].labels = labels;
+    state.chartData[mode].datasets[0].data = data;
 
-    if (!state.chart) {
-      state.chart = new Chart(ctx, {
+    if (!state.charts[mode]) {
+      state.charts[mode] = new Chart(ctx2, {
         type: 'line',
-        data: state.chartData,
+        data: state.chartData[mode],
         options: {
           responsive: true,
           animation: false,
@@ -119,21 +120,49 @@
         },
       });
     } else {
-      state.chart.update();
+      state.charts[mode].update();
     }
+  }
+
+  function renderLiveControls(snap) {
+    const liveTree = (snap.modes || {}).live;
+    const hasLive = !!snap.live_available;
+    const tab = document.querySelector('.tab[data-mode="live"] .live-pill');
+    if (!hasLive) {
+      if (tab) { tab.textContent = 'unavailable'; tab.className = 'pill live-pill warn'; }
+      $('live-unavailable').classList.remove('hidden');
+      return;
+    }
+    $('live-unavailable').classList.add('hidden');
+    const armed = !!(liveTree && liveTree.armed);
+    const killed = !!(liveTree && liveTree.kill_switch);
+    const statusEl = $('live-status');
+    if (killed) { statusEl.textContent = 'KILLED'; statusEl.className = 'pill danger'; }
+    else if (armed) { statusEl.textContent = 'ARMED'; statusEl.className = 'pill ok'; }
+    else { statusEl.textContent = 'disarmed'; statusEl.className = 'pill'; }
+    if (tab) {
+      tab.textContent = killed ? 'killed' : (armed ? 'armed' : 'disarmed');
+      tab.className = 'pill live-pill ' + (killed ? 'danger' : (armed ? 'ok' : ''));
+    }
+    $('live-arm').disabled = armed || killed;
+    $('live-disarm').disabled = !armed;
+    $('live-kill').disabled = killed;
+    $('live-kill-clear').disabled = !killed;
+  }
+
+  function renderTree(mode, tree) {
+    if (!tree) return;
+    $('lots-input-' + mode).value = tree.lots_per_trade || 1;
+    renderKpis(mode, tree.aggregate || {});
+    const engines = tree.engines || {};
+    UNDERLYINGS.forEach(u => renderCycle(mode, u, engines[u]));
   }
 
   function renderAll(snap) {
     state.snapshot = snap;
-    $('mode-pill').textContent = 'mode: ' + (snap.mode || '?');
-    $('mode-select').value = snap.mode || 'paper';
-    $('lots-input').value = snap.lots_per_trade || 1;
-    renderKpis(snap);
-    const engines = snap.engines || {};
-    renderCycle('NIFTY', engines.NIFTY);
-    renderCycle('BANKNIFTY', engines.BANKNIFTY);
-    renderTrades(snap.closed_trades || []);
-    renderPnlChart(snap.closed_trades || []);
+    const modes = snap.modes || {};
+    MODES.forEach(m => renderTree(m, modes[m]));
+    renderLiveControls(snap);
   }
 
   async function fetchStatus() {
@@ -143,13 +172,23 @@
     } catch (e) { /* ignore */ }
   }
 
+  async function fetchTrades(mode) {
+    try {
+      const res = await fetch('/api/closed_trades?mode=' + mode);
+      if (!res.ok) return;
+      const body = await res.json();
+      renderTrades(mode, body.trades || []);
+      renderPnlChart(mode, body.trades || []);
+    } catch (e) { /* ignore */ }
+  }
+
   function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(proto + '://' + location.host + '/ws');
     const conn = $('conn');
-    ws.onopen = () => { conn.textContent = 'WS: connected'; conn.style.background = '#1f3323'; };
+    ws.onopen = () => { conn.textContent = 'WS: connected'; conn.className = 'pill ok'; };
     ws.onclose = () => {
-      conn.textContent = 'WS: reconnecting…'; conn.style.background = '#331f22';
+      conn.textContent = 'WS: reconnecting…'; conn.className = 'pill warn';
       setTimeout(connectWs, 1500);
     };
     ws.onerror = () => ws.close();
@@ -159,33 +198,72 @@
         if (msg.kind === 'snapshot' && msg.payload) {
           renderAll(msg.payload);
         } else {
-          // partial update — re-fetch status for now (cheap, localhost).
           fetchStatus();
         }
       } catch (e) { /* ignore */ }
     };
   }
 
+  function selectTab(mode) {
+    state.activeMode = mode;
+    document.querySelectorAll('.tab').forEach(btn => {
+      const on = btn.dataset.mode === mode;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    document.querySelectorAll('.pane').forEach(p => p.classList.toggle('hidden', p.id !== 'pane-' + mode));
+    fetchTrades(mode);
+  }
+
+  async function postJson(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     fetchStatus();
+    fetchTrades('paper');
+    fetchTrades('live');
     connectWs();
-    setInterval(fetchStatus, 2000); // safety net
+    setInterval(() => { fetchStatus(); fetchTrades(state.activeMode); }, 2500);
 
-    $('apply-config').addEventListener('click', async () => {
-      const mode = $('mode-select').value;
-      const lots = parseInt($('lots-input').value || '1', 10);
-      const body = { lots_per_trade: lots };
-      await fetch('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-      if (mode !== (state.snapshot && state.snapshot.mode)) {
-        if (mode === 'live' && !confirm('Switch to LIVE trading? Real orders will be placed on Dhan.')) return;
-        await fetch('/api/mode', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode, confirm: true }) });
-      }
+    document.querySelectorAll('.tab').forEach(btn =>
+      btn.addEventListener('click', () => selectTab(btn.dataset.mode))
+    );
+
+    document.querySelectorAll('.apply').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const mode = btn.dataset.mode;
+        const lots = parseInt($('lots-input-' + mode).value || '1', 10);
+        await postJson('/api/config', { mode, lots_per_trade: lots });
+        fetchStatus();
+      });
+    });
+
+    $('live-arm').addEventListener('click', async () => {
+      if (!confirm('Arm LIVE trading? Real orders will be placed on Dhan when signals fire.')) return;
+      const res = await postJson('/api/live/arm', { confirm: true });
+      if (!res.ok) alert('Arm failed: ' + (await res.text()));
       fetchStatus();
     });
 
-    $('kill-switch').addEventListener('click', async () => {
-      if (!confirm('Kill switch: halts entries and force-closes all positions. Continue?')) return;
-      await fetch('/api/kill', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm: true }) });
+    $('live-disarm').addEventListener('click', async () => {
+      await postJson('/api/live/disarm');
+      fetchStatus();
+    });
+
+    $('live-kill').addEventListener('click', async () => {
+      if (!confirm('Kill switch: disarms live and force-closes every live position. Continue?')) return;
+      await postJson('/api/live/kill', { confirm: true });
+      fetchStatus();
+    });
+
+    $('live-kill-clear').addEventListener('click', async () => {
+      if (!confirm('Clear the kill flag? (This does not re-arm — you still need to click Arm afterwards.)')) return;
+      await postJson('/api/live/kill/clear');
       fetchStatus();
     });
   });

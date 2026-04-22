@@ -52,17 +52,17 @@ class EngineConfig(BaseModel):
     lazy_enabled: bool = True
     entry_price_source: Literal["close", "next_open"] = "close"
     sl_price_source: Literal["close", "low"] = "close"
-    lots_per_trade: int = 1
+    lots_per_trade_paper: int = 1
+    lots_per_trade_live: int = 1
     max_concurrent_cycles: int = 2
 
 
 class MtmProfile(BaseModel):
-    profile: Literal["protective", "tight", "custom"] = "protective"
+    """Cycle exit thresholds. Only max_loss and target are used — lock-and-trail
+    was removed because backtests showed it didn't move the needle at our
+    per-cycle horizons."""
     max_loss: float
     target: float
-    lock_activation: float
-    lock_floor: float
-    trail_step: float = 1.0
 
 
 class InstrumentConfig(BaseModel):

@@ -12,54 +12,108 @@
   <header>
     <h1>volscalp <small>Repeated OTM Strangle</small></h1>
     <div class="controls">
-      <span class="pill" id="mode-pill">—</span>
-      <label>Mode:
-        <select id="mode-select">
-          <option value="paper">Paper</option>
-          <option value="live">Live</option>
-        </select>
-      </label>
-      <label>Lots/trade:
-        <input id="lots-input" type="number" min="1" max="100" value="1" />
-      </label>
-      <button id="apply-config">Apply</button>
-      <button id="kill-switch" class="danger">Kill switch</button>
       <span id="conn" class="pill">WS: connecting…</span>
     </div>
   </header>
 
-  <section class="kpis" id="kpis">
-    <!-- filled by JS -->
-  </section>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-mode="paper" role="tab" aria-selected="true">
+      <span>Paper</span><span class="pill paper-pill">always on</span>
+    </button>
+    <button class="tab" data-mode="live" role="tab" aria-selected="false">
+      <span>Live</span><span class="pill live-pill">unavailable</span>
+    </button>
+  </nav>
 
-  <section class="grid">
-    <article class="card">
-      <h2>NIFTY — cycle</h2>
-      <div id="cycle-NIFTY" class="cycle-panel"></div>
-    </article>
-    <article class="card">
-      <h2>BANKNIFTY — cycle</h2>
-      <div id="cycle-BANKNIFTY" class="cycle-panel"></div>
-    </article>
-  </section>
+  <main>
+    <!-- ============== PAPER ============== -->
+    <section class="pane" id="pane-paper">
+      <div class="pane-controls">
+        <label>Lots/trade:
+          <input id="lots-input-paper" type="number" min="1" max="100" value="1" />
+        </label>
+        <button class="apply" data-mode="paper">Apply</button>
+      </div>
 
-  <section class="card">
-    <h2>P&amp;L curve (cycle-by-cycle)</h2>
-    <canvas id="pnl-chart" height="120"></canvas>
-  </section>
+      <section class="kpis" id="kpis-paper"></section>
 
-  <section class="card">
-    <h2>Closed trades (today)</h2>
-    <table id="trades">
-      <thead>
-        <tr>
-          <th>#</th><th>Underlying</th><th>Start</th><th>End</th>
-          <th>Reason</th><th>Peak</th><th>Trough</th><th>P&amp;L</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
+      <section class="grid">
+        <article class="card">
+          <h2>NIFTY — cycle</h2>
+          <div id="cycle-paper-NIFTY" class="cycle-panel"></div>
+        </article>
+        <article class="card">
+          <h2>BANKNIFTY — cycle</h2>
+          <div id="cycle-paper-BANKNIFTY" class="cycle-panel"></div>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>P&amp;L curve — paper</h2>
+        <canvas id="pnl-chart-paper" height="120"></canvas>
+      </section>
+
+      <section class="card">
+        <h2>Closed trades — paper</h2>
+        <table id="trades-paper">
+          <thead>
+            <tr><th>#</th><th>Underlying</th><th>Start</th><th>End</th>
+                <th>Reason</th><th>Peak</th><th>Trough</th><th>P&amp;L</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </section>
+
+    <!-- ============== LIVE ============== -->
+    <section class="pane hidden" id="pane-live">
+      <div class="pane-controls">
+        <span id="live-status" class="pill">disarmed</span>
+        <button id="live-arm" class="primary">Arm live entries</button>
+        <button id="live-disarm" class="ghost">Disarm</button>
+        <label>Lots/trade:
+          <input id="lots-input-live" type="number" min="1" max="100" value="1" />
+        </label>
+        <button class="apply" data-mode="live">Apply</button>
+        <button id="live-kill" class="danger">Kill switch</button>
+        <button id="live-kill-clear" class="ghost">Clear kill</button>
+      </div>
+
+      <div id="live-unavailable" class="warning hidden">
+        Live mode is unavailable — Dhan credentials not set in <code>.env</code>
+        (<code>DHAN_CLIENT_ID</code> + <code>DHAN_ACCESS_TOKEN</code>).
+      </div>
+
+      <section class="kpis" id="kpis-live"></section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>NIFTY — cycle</h2>
+          <div id="cycle-live-NIFTY" class="cycle-panel"></div>
+        </article>
+        <article class="card">
+          <h2>BANKNIFTY — cycle</h2>
+          <div id="cycle-live-BANKNIFTY" class="cycle-panel"></div>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>P&amp;L curve — live</h2>
+        <canvas id="pnl-chart-live" height="120"></canvas>
+      </section>
+
+      <section class="card">
+        <h2>Closed trades — live</h2>
+        <table id="trades-live">
+          <thead>
+            <tr><th>#</th><th>Underlying</th><th>Start</th><th>End</th>
+                <th>Reason</th><th>Peak</th><th>Trough</th><th>P&amp;L</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </section>
+  </main>
 
   <footer>
     <small>Internal dashboard — 127.0.0.1 only. Rotate Dhan credentials regularly.</small>
