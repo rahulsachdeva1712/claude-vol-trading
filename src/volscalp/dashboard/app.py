@@ -56,6 +56,8 @@ def create_app(state) -> FastAPI:
         feed = state.feed
         out: dict[str, Any] = {
             "feed_connected": bool(feed and getattr(feed, "_ws", None)),
+            "feed_subscriptions": len(getattr(feed, "_subscriptions", set())) if feed else 0,
+            "feed_first_tick_seen": bool(getattr(feed, "_first_tick_logged", False)) if feed else False,
             "ticks_total": getattr(md, "ticks_total", 0) if md else 0,
             "bars_closed_total": getattr(md, "bars_closed_total", 0) if md else 0,
             "unique_securities_seen": len(getattr(md, "_unique_securities", set())) if md else 0,

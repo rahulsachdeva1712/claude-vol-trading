@@ -171,6 +171,8 @@ class DhanMarketFeed:
         self._subscriptions: set[tuple[str, int]] = set()
         self._ws: WebSocketClientProtocol | None = None
         self._stop = asyncio.Event()
+        self._first_tick_logged: bool = False
+        self._last_msg_mono: float = 0.0
 
     @property
     def request_code(self) -> int:
@@ -198,7 +200,13 @@ class DhanMarketFeed:
                     f"&clientId={self.client_id}"
                     f"&authType=2"
                 )
-                log.info("dhan_ws_connecting", feed_mode=self.feed_mode, subs=len(self._subscriptions))
+                log.info(
+                    "dhan_ws_connecting",
+                    feed_mode=self.feed_mode,
+                    request_code=self.request_code,
+                    subs=len(self._subscriptions),
+                    client_id=self.client_id,
+                )
                 async with websockets.connect(
                     url,
                     max_size=4 * 1024 * 1024,
@@ -208,14 +216,29 @@ class DhanMarketFeed:
                 ) as ws:
                     self._ws = ws
                     attempt = 0
+                    log.info("dhan_ws_connected")
                     if self._subscriptions:
-                        await ws.send(_subscribe_payload(self.request_code, list(self._subscriptions)))
+                        payload = _subscribe_payload(self.request_code, list(self._subscriptions))
+                        await ws.send(payload)
+                        sample = list(self._subscriptions)[:3]
+                        log.info(
+                            "dhan_ws_subscribed",
+                            count=len(self._subscriptions),
+                            request_code=self.request_code,
+                            sample=sample,
+                        )
+                    else:
+                        log.warning("dhan_ws_no_initial_subscriptions")
                     await self._pump(ws)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 attempt += 1
-                log.warning("dhan_ws_disconnected", error=str(e), next_retry_s=backoff, attempt=attempt)
+                log.warning(
+                    "dhan_ws_disconnected",
+                    error=str(e), error_type=type(e).__name__,
+                    next_retry_s=backoff, attempt=attempt,
+                )
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
                     return
@@ -223,15 +246,29 @@ class DhanMarketFeed:
                     continue
             finally:
                 self._ws = None
+                self._first_tick_logged = False
 
     async def _pump(self, ws: WebSocketClientProtocol) -> None:
+        binary_count = 0
+        parsed_count = 0
         async for msg in ws:
             if self._stop.is_set():
                 break
+            self._last_msg_mono = time.monotonic()
             if isinstance(msg, bytes):
+                binary_count += 1
                 tick = _parse_packet(msg)
                 if tick is not None:
-                    # Non-blocking put; drop oldest on overflow to preserve freshness.
+                    parsed_count += 1
+                    if not self._first_tick_logged:
+                        log.info(
+                            "dhan_ws_first_tick",
+                            security_id=tick.security_id,
+                            segment=tick.exchange_segment,
+                            ltp=tick.ltp,
+                            binary_msgs_before=binary_count,
+                        )
+                        self._first_tick_logged = True
                     try:
                         self.out.put_nowait(tick)
                     except asyncio.QueueFull:
@@ -240,8 +277,16 @@ class DhanMarketFeed:
                             self.out.put_nowait(tick)
                         except asyncio.QueueEmpty:
                             pass
+                elif binary_count <= 3:
+                    # Log a few early unparsed frames so we can diagnose
+                    # protocol drift without flooding the log.
+                    head = msg[:24].hex()
+                    log.info("dhan_ws_binary_unparsed", n=binary_count, head_hex=head, length=len(msg))
             else:
-                log.debug("dhan_ws_text_frame", text=str(msg)[:200])
+                # Dhan sends JSON control/ack frames — surface them, they're
+                # the fastest way to see "invalid token" / "subscription too
+                # large" etc.
+                log.warning("dhan_ws_text_frame", text=str(msg)[:400])
 
     async def subscribe(self, instruments: Iterable[tuple[str, int]]) -> None:
         new = set(instruments) - self._subscriptions
