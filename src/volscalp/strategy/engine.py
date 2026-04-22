@@ -167,7 +167,13 @@ class StrategyEngine:
     async def _start_new_cycle(self) -> None:
         spot = self.md.spot(self.underlying.value)
         if spot <= 0:
-            # Wait until we have a spot quote.
+            # Wait until we have a spot quote. Log at DEBUG-ish cadence
+            # (once every ~30s) to prove the engine is polling, not stuck.
+            now_mono = int(datetime.now(timezone.utc).timestamp())
+            last = getattr(self, "_last_waiting_spot_log", 0)
+            if now_mono - last >= 30:
+                log.info("waiting_for_spot", tag=self.tag, underlying=self.underlying.value)
+                self._last_waiting_spot_log = now_mono
             return
 
         atm = self.instruments.nearest_strike(
@@ -269,14 +275,28 @@ class StrategyEngine:
                 continue
             if leg.status != LegStatus.WATCHING:
                 continue
-            if bar.return_pct >= self.cfg.engine.momentum_threshold_pct:
+            ret_pct = round(bar.return_pct, 3)
+            threshold = self.cfg.engine.momentum_threshold_pct
+            if bar.return_pct >= threshold:
+                log.info(
+                    "entry_signal",
+                    tag=self.tag, slot=leg.slot,
+                    option_type=leg.option_type.value, strike=leg.strike,
+                    ret_pct=ret_pct, threshold=threshold, bar_close=bar.close,
+                )
                 await self._enter_leg(leg, bar)
             else:
+                log.info(
+                    "entry_skip",
+                    tag=self.tag, slot=leg.slot,
+                    option_type=leg.option_type.value, strike=leg.strike,
+                    ret_pct=ret_pct, threshold=threshold,
+                )
                 await self.db.log_decision(
                     self.session_id,
                     self.current_cycle_row_id,
                     "entry_eval",
-                    {"slot": leg.slot, "ret_pct": round(bar.return_pct, 3)},
+                    {"slot": leg.slot, "ret_pct": ret_pct},
                     "SKIP",
                 )
 

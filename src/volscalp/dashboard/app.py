@@ -48,6 +48,31 @@ def create_app(state) -> FastAPI:
     async def status() -> dict[str, Any]:
         return state.snapshot()
 
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        """Diagnostic counters — useful to confirm the feed is live and
+        signals are being evaluated even when no cycles have fired yet."""
+        md = state.market_data
+        feed = state.feed
+        out: dict[str, Any] = {
+            "feed_connected": bool(feed and getattr(feed, "_ws", None)),
+            "ticks_total": getattr(md, "ticks_total", 0) if md else 0,
+            "bars_closed_total": getattr(md, "bars_closed_total", 0) if md else 0,
+            "unique_securities_seen": len(getattr(md, "_unique_securities", set())) if md else 0,
+            "spots": {k: round(v, 2) for k, v in (getattr(md, "_spot_by_name", {}) or {}).items() if v > 0},
+            "engines": {},
+        }
+        for m, tree in state.modes.items():
+            for idx, eng in tree.engines.items():
+                out["engines"][f"{m.value}-{idx.value}"] = {
+                    "armed": eng.armed.is_set(),
+                    "cycle_no": eng.cycle_counter,
+                    "has_open_cycle": eng.current_cycle is not None,
+                    "cycle_state": eng.current_cycle.state.value if eng.current_cycle else None,
+                    "expiry": eng.expiry,
+                }
+        return out
+
     @app.get("/api/closed_trades")
     async def closed_trades(mode: str = "paper") -> dict[str, Any]:
         mode_l = mode.lower()
