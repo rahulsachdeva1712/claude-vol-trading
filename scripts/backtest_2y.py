@@ -621,20 +621,47 @@ def simulate_session(
                             else:
                                 lazy_ce_done = True
 
-            # 2a) Intrabar TARGET check — mark each ACTIVE leg at its
-            # bar.high and see if aggregate MTM would have crossed target
-            # at any tick inside this minute. Exit fills at bar.high for
-            # each ACTIVE leg. Mirrors the live engine's
-            # _evaluate_mtm_intrabar_target (strategy/engine.py), which
-            # fires MTM_TARGET off leg.last_price on every WS tick.
-            # MAX_LOSS intentionally stays on bar-close (step 2b) so a
-            # transient intrabar dip doesn't force-close a cycle that
-            # recovers. See FRD §5.2 / §5.4. Backtest 2026-04 showed
-            # +55% cycle count and +55% P&L with unchanged MAX_LOSS.
+            # 2a) Intrabar MAX_LOSS check — worst-case intrabar uses each
+            # ACTIVE leg's bar.low. MAX_LOSS has priority over TARGET per
+            # FRD §5.4. Exit fills at bar.low for each ACTIVE leg.
+            # Mirrors the live engine's _evaluate_mtm_intrabar
+            # (strategy/engine.py), which checks both thresholds off
+            # leg.last_price on every WS tick.
             any_active = any(leg.status == "ACTIVE" for leg in legs)
             if any_active:
                 intrabar_realized = sum(l.realized_pnl for l in legs)
-                intrabar_unrealized = 0.0
+                low_unrealized = 0.0
+                active_low_prices: dict[int, float] = {}
+                for leg in legs:
+                    if leg.status != "ACTIVE":
+                        continue
+                    bar = leg.active_bar(m_now)
+                    if bar is None or bar.low <= 0:
+                        continue
+                    active_low_prices[leg.slot] = bar.low
+                    low_unrealized += (bar.low - leg.entry_price) * leg.quantity
+                intrabar_low_mtm = intrabar_realized + low_unrealized
+                if intrabar_low_mtm < trough_mtm:
+                    trough_mtm = intrabar_low_mtm
+                if intrabar_low_mtm <= -abs(spec["max_loss"]):
+                    for leg in legs:
+                        if leg.status != "ACTIVE":
+                            continue
+                        fill = active_low_prices.get(leg.slot)
+                        leg.exit_price = round(
+                            fill if fill and fill > 0 else (leg.last_price or leg.entry_price),
+                            2,
+                        )
+                        leg.status = "STOPPED"
+                        leg.exit_reason = "MTM_MAX_LOSS"
+                        leg.exit_epoch = m_now
+                    cycle_exit_reason = "MTM_MAX_LOSS"
+                    break
+
+            # 2b) Intrabar TARGET check — best-case intrabar uses each
+            # ACTIVE leg's bar.high. Exit fills at bar.high.
+            if any_active:
+                high_unrealized = 0.0
                 active_high_prices: dict[int, float] = {}
                 for leg in legs:
                     if leg.status != "ACTIVE":
@@ -643,12 +670,12 @@ def simulate_session(
                     if bar is None or bar.high <= 0:
                         continue
                     active_high_prices[leg.slot] = bar.high
-                    intrabar_unrealized += (bar.high - leg.entry_price) * leg.quantity
+                    high_unrealized += (bar.high - leg.entry_price) * leg.quantity
                 target = spec.get("target")
-                intrabar_mtm = intrabar_realized + intrabar_unrealized
-                if intrabar_mtm > peak_mtm:
-                    peak_mtm = intrabar_mtm
-                if target is not None and intrabar_mtm >= target:
+                intrabar_high_mtm = intrabar_realized + high_unrealized
+                if intrabar_high_mtm > peak_mtm:
+                    peak_mtm = intrabar_high_mtm
+                if target is not None and intrabar_high_mtm >= target:
                     for leg in legs:
                         if leg.status != "ACTIVE":
                             continue
@@ -663,7 +690,7 @@ def simulate_session(
                     cycle_exit_reason = "MTM_TARGET"
                     break
 
-            # 2b) Bar-close MTM — for MAX_LOSS gating and trough tracking.
+            # 2c) Bar-close MTM — peak/trough stamp using close-sample.
             mtm = sum(l.realized_pnl for l in legs) + sum(l.unrealized_pnl for l in legs)
             if mtm > peak_mtm:
                 peak_mtm = mtm
@@ -675,20 +702,6 @@ def simulate_session(
             if t_ist >= SESSION_END:
                 cycle_exit_reason = "SESSION_CLOSE"
                 break
-
-            # 4) Aggregate-MTM (cycle-portfolio) MAX_LOSS exit fires while
-            #    at least one leg is ACTIVE. Target was moved to the
-            #    intrabar path above (2a); MAX_LOSS stays on bar-close.
-            #    Mirrors Codex spread_lab.py:1251 — if all open positions
-            #    have closed and we're just waiting on a WATCHING lazy/
-            #    base to enter, the portfolio P&L is purely realized and
-            #    the cycle stays "alive" until either a new leg enters or
-            #    the cycle-done check below breaks.
-            any_active = any(leg.status == "ACTIVE" for leg in legs)
-            if any_active:
-                if mtm <= -abs(spec["max_loss"]):
-                    cycle_exit_reason = "MTM_MAX_LOSS"
-                    break
 
             # 7) Cycle-done check — a cycle is "done" when there are no
             #    legs in ACTIVE or WATCHING state. This means:

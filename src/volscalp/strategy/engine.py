@@ -207,15 +207,14 @@ class StrategyEngine:
             await self._start_new_cycle()
             return
 
-        # Intrabar target-only MTM check. Runs every engine tick (1Hz) off
-        # leg.last_price — which _on_tick keeps fresh from the WS feed — so
-        # take-profit fires the moment aggregate MTM crosses the threshold
-        # instead of waiting for bar close. MAX_LOSS intentionally stays on
-        # bar close (via _evaluate_mtm in _on_bar_close) so a transient
-        # mid-bar dip doesn't force-close a cycle that would have recovered.
-        # Backtest 2026-04 showed +55% cycle count and +55% P&L with
-        # unchanged MAX_LOSS cadence. See FRD §5.2 / §5.4.
-        await self._evaluate_mtm_intrabar_target()
+        # Intrabar MTM check — runs every engine tick (1 Hz) off
+        # leg.last_price, which _on_tick keeps fresh from the WS feed.
+        # Both MAX_LOSS (priority) and TARGET are evaluated here, so
+        # either threshold fires the moment aggregate MTM crosses it
+        # rather than waiting for bar close. The bar-close pass in
+        # _on_bar_close -> _evaluate_mtm remains as a last-resort
+        # safety net + end-of-bar peak/trough stamp. See FRD §5.2 / §5.4.
+        await self._evaluate_mtm_intrabar()
 
         # Cycle-done detector (aggregate-MTM semantics — FRD §5.2 / §6.1):
         # If every leg in the current cycle has already stopped (or was
@@ -627,14 +626,14 @@ class StrategyEngine:
              "legs": self._legs_snapshot()},
         )
 
-    async def _evaluate_mtm_intrabar_target(self) -> None:
-        """Intrabar target-only MTM check — runs every engine tick (1Hz).
+    async def _evaluate_mtm_intrabar(self) -> None:
+        """Intrabar MTM check — runs every engine tick (1 Hz).
 
         Uses ``leg.last_price``, which ``_on_tick`` refreshes on every WS
-        tick, to compute aggregate MTM and fire MTM_TARGET the moment the
-        take-profit threshold is crossed. MAX_LOSS is NOT evaluated here —
-        it stays end-of-bar (``_evaluate_mtm`` on bar close) so a transient
-        intrabar dip doesn't force-close a cycle that would have recovered.
+        tick, to compute aggregate MTM and fire MTM_MAX_LOSS or
+        MTM_TARGET the moment either threshold is crossed. MAX_LOSS has
+        priority over TARGET (FRD §5.4). The bar-close pass in
+        ``_evaluate_mtm`` is a safety-net backstop for the same checks.
         """
         cycle = self.current_cycle
         if not cycle or not self._mtm_ctrl:
@@ -648,16 +647,18 @@ class StrategyEngine:
         realized = sum(leg.realized_pnl for leg in cycle.legs.values())
         mtm = unrealized + realized
 
-        decision = self._mtm_ctrl.evaluate_target_only(cycle, mtm)
+        decision = self._mtm_ctrl.evaluate_intrabar(cycle, mtm)
         if decision.exit:
             log.info(
-                "intrabar_target_hit",
+                "intrabar_mtm_hit",
                 tag=self.tag,
                 cycle=cycle.cycle_id,
                 mtm=round(mtm, 2),
+                reason=decision.reason.value if decision.reason else None,
+                max_loss=self.profile.max_loss,
                 target=self.profile.target,
             )
-            await self._force_close_all(decision.reason or ExitReason.MTM_TARGET)
+            await self._force_close_all(decision.reason or ExitReason.MTM_MAX_LOSS)
 
     async def _force_close_all(self, reason: ExitReason) -> None:
         cycle = self.current_cycle
