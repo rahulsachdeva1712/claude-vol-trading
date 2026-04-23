@@ -51,18 +51,34 @@ class EngineConfig(BaseModel):
     lazy_leg_sl_pct: float = 12.0
     lazy_enabled: bool = True
     entry_price_source: Literal["close", "next_open"] = "close"
-    sl_price_source: Literal["close", "low"] = "close"
+    sl_price_source: Literal["close", "low"] = "low"
     lots_per_trade_paper: int = 1
     lots_per_trade_live: int = 1
     max_concurrent_cycles: int = 2
 
 
 class MtmProfile(BaseModel):
-    """Cycle exit thresholds. Only max_loss and target are used — lock-and-trail
-    was removed because backtests showed it didn't move the needle at our
-    per-cycle horizons."""
+    """Cycle exit thresholds.
+
+    Aggregate-MTM (realised + unrealised) is checked every bar in this
+    priority order, mirroring Codex's ``simulate_strategy_day``:
+
+        1. ``mtm <= -max_loss``   → MTM_MAX_LOSS
+        2. ``mtm >= target``      → MTM_TARGET
+        3. ``mtm <= lock_floor``  → LOCK_TRAIL
+           (only active once peak has crossed ``lock_start``)
+
+    Lock-and-trail ratchets: once ``peak >= lock_start``, the floor starts
+    at ``lock_profit`` and moves up by ``trail_lock_step`` for every full
+    ``trail_step`` rupees of peak above ``lock_start``. Set the lock
+    fields to ``None`` (or leave defaults) to disable the ratchet.
+    """
     max_loss: float
     target: float
+    lock_start: float | None = None
+    lock_profit: float | None = None
+    trail_step: float | None = None
+    trail_lock_step: float | None = None
 
 
 class InstrumentConfig(BaseModel):

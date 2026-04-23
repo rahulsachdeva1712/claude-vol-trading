@@ -20,32 +20,51 @@ engine:
   lazy_leg_sl_pct: 12.0
   lazy_enabled: true
   entry_price_source: close    # close | next_open
-  sl_price_source: close       # close | low (intrabar)
+  sl_price_source: low         # close | low (intrabar) — default 'low' matches
+                               # Codex's simulate_strategy_day SL trigger and
+                               # the 2y backtest's intrabar SL check, so
+                               # backtest, paper, and live all fire stops on
+                               # the same bar.
   lots_per_trade_paper: 1      # per-mode lot size
   lots_per_trade_live:  1
   max_concurrent_cycles: 2     # 1 per index max
 
-# Simple MTM: cycle exits on max_loss or target (lock-and-trail removed
-# after simulation showed no material benefit for the intended horizons).
+# Aggregate-MTM exit: (realised + unrealised) summed across all legs of
+# the current cycle is evaluated every bar, priority
+#   max_loss → target → lock_trail (once armed).
+# Values mirror Codex's "Tight MTM" profile (spread_lab.py) which is the
+# configuration the 2y replay is validated against. Dashboard UI can
+# override any of these per-index at runtime.
 mtm_profiles:
   NIFTY:
-    max_loss: 2500
+    max_loss: 3500
     target:    300
+    lock_start:      500      # arm trail once peak crosses this
+    lock_profit:     350      # initial protective floor when armed
+    trail_step:      100      # raise floor every +100 of peak beyond lock_start
+    trail_lock_step: 100      # by this much each step
   BANKNIFTY:
-    max_loss: 2500
+    max_loss: 3500
     target:    300
+    lock_start:      500
+    lock_profit:     350
+    trail_step:      100
+    trail_lock_step: 100
 
 instruments:
   # Dhan uses SecurityId + ExchangeSegment. These are populated from the
   # instrument master at startup — only configure overrides here.
+  # Lot sizes mirror the current NSE contract specification. Update here AND
+  # in the backtest scripts (scripts/backtest_2y.py, scripts/backtest.py) if
+  # the exchange revises contract sizes.
   NIFTY:
     underlying_symbol: "NIFTY"
     strike_interval: 50
-    lot_size: 75            # NSE NIFTY options (update if exchange changes)
+    lot_size: 65            # NSE NIFTY options (current contract size)
   BANKNIFTY:
     underlying_symbol: "BANKNIFTY"
     strike_interval: 100
-    lot_size: 35           # NSE BANKNIFTY options (update if exchange changes)
+    lot_size: 30           # NSE BANKNIFTY options (current contract size)
 
 broker:
   name: dhan

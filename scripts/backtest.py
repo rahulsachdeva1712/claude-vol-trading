@@ -4,7 +4,7 @@ Mirrors the live strategy exactly:
   - Cycle opens at 09:30 IST (ATM computed from spot at that minute)
   - Base legs: ATM+6 CE (long), ATM-6 PE (long) -- both start WATCHING
   - Entry on 1-min option bar close if bar.return_pct >= 1.0 %
-  - Leg SL: entry * 0.85 for base, entry * 0.88 for lazy (close-based)
+  - Leg SL: entry * 0.85 for base, entry * 0.88 for lazy (intrabar low)
   - Lazy leg on opposite side after a base leg stops, fresh ATM, slot 3/4
   - Cycle exits on: kill (N/A here) -> session close 15:15 -> max_loss -> target -> leg SL
   - Cooldown = 0; next cycle opens on the first eligible minute after close
@@ -51,9 +51,11 @@ SESSION_START = time(9, 30)
 SESSION_END = time(15, 15)
 
 # Per-index config.
+# Lot sizes match the current NSE exchange values (NIFTY=65, BANKNIFTY=30).
+# Update here AND in configs/default.yaml if the exchange bumps lot sizes.
 INDEX_SPECS = {
-    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 75, "max_loss": 2500, "target": 300},
-    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 35, "max_loss": 2500, "target": 300},
+    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 65, "max_loss": 3500, "target": 300},
+    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 30, "max_loss": 3500, "target": 300},
 }
 
 
@@ -85,7 +87,7 @@ class Leg:
     strike: int
     security_id: int = 0
     lots: int = 1
-    lot_size: int = 75
+    lot_size: int = 65
     status: Literal["WATCHING", "ACTIVE", "STOPPED", "EMPTY"] = "WATCHING"
     entry_price: float = 0.0
     sl_price: float = 0.0
@@ -369,8 +371,11 @@ async def simulate_day(
                         leg.status = "ACTIVE"
                         legs_entered += 1
                 elif leg.status == "ACTIVE":
-                    if bar.close <= leg.sl_price:
-                        leg.exit_price = bar.close
+                    # Intrabar SL trigger on bar.low (matches engine default
+                    # engine.sl_price_source='low' + backtest_2y.py + Codex
+                    # simulate_strategy_day). Fill at exactly sl_price.
+                    if bar.low <= leg.sl_price:
+                        leg.exit_price = leg.sl_price
                         leg.status = "STOPPED"
                         leg.exit_reason = "LEG_SL"
                         # Lazy-leg scheduling on opposite side.

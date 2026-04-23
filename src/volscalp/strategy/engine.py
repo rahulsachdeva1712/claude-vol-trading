@@ -8,8 +8,13 @@ session id — is per-engine.
 
 Hot path:
     tick → update leg last_price → recompute cycle MTM → MtmController
-    bar close → entry evaluation (momentum) → place orders
-    leg SL hit (per-bar) → exit that leg → maybe schedule lazy leg
+    bar close → entry evaluation (momentum) for BASE legs → place orders
+    leg SL hit (per-bar) → exit that leg → immediately enter opposite lazy
+        leg (no momentum gate — Codex aggregate-MTM semantics)
+    cycle aggregate MTM (realized + unrealized) crosses target/max_loss
+        → force-close remaining ACTIVE legs
+    last surviving leg exits and no lazy is pending → cycle is "done"
+        → next cycle spins up on the next bar
     session close → force-close everything
 
 Every decision is timestamped and (best-effort) logged to the DB via the
@@ -158,11 +163,56 @@ class StrategyEngine:
             await self._start_new_cycle()
             return
 
+        # Cycle-done detector (aggregate-MTM semantics — FRD §5.2 / §6.1):
+        # If every leg in the current cycle has already stopped (or was
+        # never filled) and nothing is still WATCHING for a momentum
+        # entry, the cycle is done — close it and let the next tick spin
+        # up a new one (cooldown=0). Without this, a cycle where both
+        # bases SL out and no lazy is eligible would idle all the way to
+        # session close, blocking further cycles for the day. This
+        # matches the behaviour of scripts/backtest_2y.py's cycle-done
+        # break (see §5-7 of simulate_session).
+        if (
+            self.current_cycle.state != CycleState.CLOSED
+            and self._cycle_is_done(self.current_cycle)
+        ):
+            reason = self._last_leg_exit_reason(self.current_cycle) or ExitReason.LEG_SL
+            await self._force_close_all(reason)
+
         # If the current cycle is fully closed, open the next (cooldown = 0).
         if self.current_cycle.state == CycleState.CLOSED:
             self.current_cycle = None
             if not after_close and self.armed.is_set():
                 await self._start_new_cycle()
+
+    @staticmethod
+    def _cycle_is_done(cycle) -> bool:
+        """True when no leg is still alive — i.e. everyone is STOPPED or
+        EMPTY, with at least one leg actually in a terminal state (so a
+        cycle that just started with only EMPTY slots from a missing
+        strike chain also returns True and gets re-opened quickly)."""
+        has_alive = any(
+            leg.status in (LegStatus.WATCHING, LegStatus.PENDING,
+                           LegStatus.ACTIVE, LegStatus.EXITING)
+            for leg in cycle.legs.values()
+        )
+        if has_alive:
+            return False
+        has_any_leg = bool(cycle.legs)
+        return has_any_leg
+
+    @staticmethod
+    def _last_leg_exit_reason(cycle) -> ExitReason | None:
+        """Return the exit reason of the most recently stopped leg.
+        Used to label a cycle that ran out of alive legs with the same
+        reason the last leg reported (e.g. LEG_SL if the final leg SL'd
+        out). Mirrors Codex spread_lab.py:1360."""
+        stopped = [leg for leg in cycle.legs.values()
+                   if leg.status == LegStatus.STOPPED and leg.exit_bar_ts]
+        if not stopped:
+            return None
+        stopped.sort(key=lambda leg: leg.exit_bar_ts, reverse=True)
+        return stopped[0].exit_reason
 
     async def _start_new_cycle(self) -> None:
         spot = self.md.spot(self.underlying.value)
@@ -300,14 +350,16 @@ class StrategyEngine:
                     "SKIP",
                 )
 
-        # SL check for ACTIVE legs (close-based per FRD default).
+        # SL check for ACTIVE legs. Default ref price is bar.low (intrabar
+        # trigger; matches Codex's simulate_strategy_day + backtest_2y). Set
+        # engine.sl_price_source=close in YAML for end-of-bar simulation.
         for leg in list(cycle.legs.values()):
             if leg.security_id != bar.security_id or leg.status != LegStatus.ACTIVE:
                 continue
             ref_price = bar.close if self.cfg.engine.sl_price_source == "close" else bar.low
             if ref_price <= leg.sl_price:
                 await self._exit_leg(leg, ref_price, ExitReason.LEG_SL)
-                await self._maybe_schedule_lazy_leg(leg)
+                await self._maybe_schedule_lazy_leg(leg, bar)
 
         # Cycle-level MTM re-evaluation.
         await self._evaluate_mtm()
@@ -416,7 +468,14 @@ class StrategyEngine:
              "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
         )
 
-    async def _maybe_schedule_lazy_leg(self, stopped: Leg) -> None:
+    async def _maybe_schedule_lazy_leg(self, stopped: Leg, bar: Bar) -> None:
+        """Enter the lazy (opposite-side OTM) leg at the stop-minute bar close.
+
+        Codex semantics: lazy leg goes ACTIVE immediately when the base leg
+        stops — there is no subsequent momentum-gate wait. The entry price is
+        the current (stop-minute) close of the lazy instrument; if we have no
+        fresh bar for it yet we fall back to the last known LTP.
+        """
         cycle = self.current_cycle
         if not cycle or not self.cfg.engine.lazy_enabled or stopped.kind != LegKind.BASE:
             return
@@ -446,15 +505,37 @@ class StrategyEngine:
 
         leg = self._new_leg_slot(slot, LegKind.LAZY, opposite, strike)
         inst = self.instruments.get(self.underlying.value, self.expiry, strike, opposite)
-        if inst:
-            leg.security_id = inst.security_id
-            leg.trading_symbol = inst.trading_symbol
-            if not leg.lot_size:
-                leg.lot_size = inst.lot_size
-        else:
+        if not inst:
             log.warning("lazy_leg_strike_missing", strike=strike, option_type=opposite.value)
             leg.status = LegStatus.EMPTY
+            cycle.legs[slot] = leg
+            return
+
+        leg.security_id = inst.security_id
+        leg.trading_symbol = inst.trading_symbol
+        if not leg.lot_size:
+            leg.lot_size = inst.lot_size
         cycle.legs[slot] = leg
+
+        # Build a bar for the lazy instrument at the same stop-minute. Prefer
+        # the live candle builder's in-progress bar; fall back to last LTP
+        # wrapped in a minimal OHLC shell so _enter_leg has a close to use.
+        lazy_bar = self.md.current_bar(leg.security_id)
+        if lazy_bar is None or lazy_bar.close <= 0:
+            px = self.md.last_ltp(leg.security_id)
+            if px <= 0:
+                log.warning(
+                    "lazy_leg_no_price",
+                    slot=slot, strike=strike, option_type=opposite.value,
+                )
+                leg.status = LegStatus.EMPTY
+                return
+            lazy_bar = Bar(
+                security_id=leg.security_id,
+                minute_epoch=bar.minute_epoch,
+                open=px, high=px, low=px, close=px,
+            )
+
         log.info(
             "lazy_leg_scheduled",
             tag=self.tag,
@@ -463,7 +544,10 @@ class StrategyEngine:
             slot=slot,
             strike=strike,
             option_type=opposite.value,
+            entry_price=lazy_bar.close,
         )
+
+        await self._enter_leg(leg, lazy_bar)
 
     # ---- MTM ---------------------------------------------------------------
 
