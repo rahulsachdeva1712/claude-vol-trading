@@ -221,3 +221,34 @@ class Database:
         cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
                 "exit_reason", "started_at", "ended_at"]
         return [dict(zip(cols, r)) for r in rows]
+
+    async def fetch_mode_cumulative_pnl(self, mode_label: str) -> float:
+        """Sum of closed-cycle P&L across every session ever recorded for
+        this mode (paper | live). Survives process restarts."""
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT COALESCE(SUM(c.cycle_pnl), 0)
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.ended_at IS NOT NULL""",
+            (mode_label,),
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
+    async def fetch_closed_trades_all_sessions(self, mode_label: str) -> list[dict[str, Any]]:
+        """Closed cycles across every session for a mode, newest first."""
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT c.id, c.cycle_no, c.underlying, c.cycle_pnl, c.peak_mtm, c.trough_mtm,
+                      c.exit_reason, c.started_at, c.ended_at, s.session_date
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.ended_at IS NOT NULL
+               ORDER BY c.id DESC""",
+            (mode_label,),
+        ) as cur:
+            rows = await cur.fetchall()
+        cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
+                "exit_reason", "started_at", "ended_at", "session_date"]
+        return [dict(zip(cols, r)) for r in rows]

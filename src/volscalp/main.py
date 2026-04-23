@@ -125,6 +125,9 @@ class RuntimeState:
         self.dhan_client: DhanClient | None = None
         self.modes: dict[Mode, ModeTree] = {}
         self._arm_lock = asyncio.Lock()
+        # Lifetime P&L per mode, refreshed from SQLite every ~5 s so the
+        # "Cumulative P&L" KPI survives process restarts.
+        self.cumulative_pnl_by_mode: dict[Mode, float] = {}
 
     # ---- registry --------------------------------------------------------
 
@@ -188,7 +191,9 @@ class RuntimeState:
                 "realized_pnl": round(realized_total, 2),
                 "unrealized_pnl": round(unrealized_total, 2),
                 "total_mtm": round(realized_total + unrealized_total, 2),
-                "cumulative_pnl": round(realized_total, 2),
+                # Cumulative across ALL recorded sessions for this mode —
+                # pulled from SQLite, so it persists across restarts.
+                "cumulative_pnl": round(self.cumulative_pnl_by_mode.get(tree.mode, 0.0), 2),
                 "open_positions": open_positions,
                 "closed_cycles": closed_total,
                 "win_rate_pct": round(win_rate, 1),
@@ -467,6 +472,19 @@ async def _run(cfg: AppConfig) -> int:
         state.reconciler = PositionReconciler(dhan_client, interval_s=cfg.broker.reconcile_interval_s)
         reconciler_task = asyncio.create_task(state.reconciler.run(), name="reconciler")
 
+    async def cumulative_pnl_refresher() -> None:
+        """Keep state.cumulative_pnl_by_mode in sync with SQLite every 5 s."""
+        while not shutdown_event().is_set():
+            for mode in state.modes:
+                try:
+                    state.cumulative_pnl_by_mode[mode] = await db.fetch_mode_cumulative_pnl(mode.value)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("cumulative_pnl_refresh_error", mode=mode.value, error=str(exc))
+            try:
+                await asyncio.wait_for(shutdown_event().wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+
     # Engines.
     engine_tasks = [
         asyncio.create_task(e.run(), name=f"engine-{e.mode.value}-{e.underlying.value}")
@@ -474,6 +492,7 @@ async def _run(cfg: AppConfig) -> int:
     ]
     md_task = asyncio.create_task(market_data.run(), name="market_data")
     sub_task = asyncio.create_task(dynamic_subscriber(), name="dynamic_subscriber")
+    cum_task = asyncio.create_task(cumulative_pnl_refresher(), name="cumulative_pnl_refresher")
 
     # Dashboard server.
     app = create_app(state)
@@ -531,7 +550,7 @@ async def _run(cfg: AppConfig) -> int:
     await run_shutdown_callbacks()
 
     all_tasks = [t for t in (
-        md_task, sub_task, server_task, feed_task, reconciler_task, *engine_tasks,
+        md_task, sub_task, cum_task, server_task, feed_task, reconciler_task, *engine_tasks,
     ) if t is not None]
     for t in all_tasks:
         t.cancel()
