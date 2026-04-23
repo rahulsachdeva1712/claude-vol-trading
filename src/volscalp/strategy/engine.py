@@ -108,15 +108,59 @@ class StrategyEngine:
     def stop(self) -> None:
         self._stop.set()
 
+    async def _backfill_counters_from_db(self) -> None:
+        """Rehydrate in-memory KPI counters from today's closed cycles.
+
+        A new DB session row is created on every process start, so without
+        this the KPI strip would show zeros after any mid-day restart even
+        though today's cycles are safely on disk. The reconstruction is
+        across all sessions for this (mode, underlying) on today's date,
+        so multiple restarts in a single trading day still roll up into
+        one view.
+
+        Peak/trough here are the running max/min of cumulative realized
+        P&L across cycle-close boundaries; we can't recover intra-cycle
+        MTM from the DB, but cycle-close boundaries are a faithful
+        reconstruction of what the engine held at the moment of its last
+        close, and the live tick loop will immediately start updating
+        peak/trough again against unrealized MTM once a new cycle opens.
+        """
+        today_iso = datetime.now(self.tz).date().isoformat()
+        try:
+            kpis = await self.db.fetch_today_engine_kpis(
+                self.mode.value, self.underlying.value, today_iso,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kpi_backfill_failed", tag=self.tag, error=str(exc))
+            return
+
+        if not kpis or kpis.get("closed_cycles", 0) == 0:
+            return
+
+        self.realized_pnl = float(kpis["realized_pnl"])
+        self.closed_cycles_count = int(kpis["closed_cycles"])
+        self.win_count = int(kpis["wins"])
+        self.loss_count = int(kpis["losses"])
+        self.peak_session_pnl = float(kpis["peak_session_pnl"])
+        self.trough_session_pnl = float(kpis["trough_session_pnl"])
+        # New cycles opened in this process should continue numbering from
+        # today's max — the UI labels cycles 1..N per trading day, not per
+        # process boot.
+        self.cycle_counter = int(kpis["max_cycle_no"])
+
     async def run(self) -> None:
         """Engine driver — pumps the cycle state machine on a 1-second tick."""
         self.expiry = self.instruments.pick_expiry(self.underlying, self.cfg.expiry)
+        await self._backfill_counters_from_db()
         log.info(
             "engine_started",
             tag=self.tag,
             underlying=self.underlying.value,
             mode=self.mode.value,
             expiry=self.expiry,
+            backfilled_realized_pnl=round(self.realized_pnl, 2),
+            backfilled_cycles=self.closed_cycles_count,
+            backfilled_cycle_counter=self.cycle_counter,
         )
 
         while not self._stop.is_set():

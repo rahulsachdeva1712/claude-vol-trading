@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -83,7 +85,13 @@ def create_app(state) -> FastAPI:
         m = Mode(mode_l)
         if m not in state.modes:
             return {"mode": mode_l, "trades": []}
-        rows = await state.db.fetch_closed_trades(state.modes[m].session_id)
+        # Scope by (mode, session_date) rather than session_id so a
+        # mid-session process restart (which opens a new session row)
+        # still shows today's full cycle history. Matches the engine's
+        # startup backfill of KPI counters.
+        tz = ZoneInfo(state.cfg.session.timezone)
+        today_iso = datetime.now(tz).date().isoformat()
+        rows = await state.db.fetch_closed_trades_today(mode_l, today_iso)
         return {"mode": mode_l, "trades": rows}
 
     @app.post("/api/config")

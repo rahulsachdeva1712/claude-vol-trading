@@ -252,3 +252,84 @@ class Database:
         cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
                 "exit_reason", "started_at", "ended_at", "session_date"]
         return [dict(zip(cols, r)) for r in rows]
+
+    async def fetch_closed_trades_today(
+        self, mode_label: str, today_date: str
+    ) -> list[dict[str, Any]]:
+        """Closed cycles for a mode on a specific session_date, newest first.
+
+        A new DB session row is created on every process start, so by
+        session_id alone the Closed Trades table empties after a restart.
+        Scoping by session_date rolls up all of today's cycles across any
+        sessions the engine opened today.
+        """
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT c.id, c.cycle_no, c.underlying, c.cycle_pnl, c.peak_mtm, c.trough_mtm,
+                      c.exit_reason, c.started_at, c.ended_at, s.session_date
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND s.session_date = ? AND c.ended_at IS NOT NULL
+               ORDER BY c.id DESC""",
+            (mode_label, today_date),
+        ) as cur:
+            rows = await cur.fetchall()
+        cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
+                "exit_reason", "started_at", "ended_at", "session_date"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def fetch_today_engine_kpis(
+        self, mode_label: str, underlying: str, today_date: str
+    ) -> dict[str, Any]:
+        """Reconstruct in-memory engine counters from today's closed cycles.
+
+        Called on engine startup so the KPI strip (realized P&L, closed
+        cycles, wins/losses, peak/trough, cycle counter) survives a process
+        restart mid-session. Peak/trough here is the running max/min of
+        cumulative realized P&L across cycle boundaries — we can't recover
+        intra-cycle MTM after restart, but cycle-close boundaries are a
+        faithful reconstruction of what the engine would have held at the
+        moment of its last close.
+        """
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT c.cycle_no, c.cycle_pnl
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.underlying = ? AND s.session_date = ?
+                     AND c.ended_at IS NOT NULL
+               ORDER BY c.id ASC""",
+            (mode_label, underlying, today_date),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        realized_pnl = 0.0
+        wins = 0
+        losses = 0
+        peak = 0.0
+        trough = 0.0
+        max_cycle_no = 0
+        running = 0.0
+        for cycle_no, cycle_pnl in rows:
+            p = float(cycle_pnl) if cycle_pnl is not None else 0.0
+            running += p
+            if p > 0:
+                wins += 1
+            elif p < 0:
+                losses += 1
+            if running > peak:
+                peak = running
+            if running < trough:
+                trough = running
+            if cycle_no is not None and int(cycle_no) > max_cycle_no:
+                max_cycle_no = int(cycle_no)
+        realized_pnl = running
+        return {
+            "realized_pnl": realized_pnl,
+            "closed_cycles": len(rows),
+            "wins": wins,
+            "losses": losses,
+            "peak_session_pnl": peak,
+            "trough_session_pnl": trough,
+            "max_cycle_no": max_cycle_no,
+        }
