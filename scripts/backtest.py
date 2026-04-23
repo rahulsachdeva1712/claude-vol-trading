@@ -54,8 +54,8 @@ SESSION_END = time(15, 15)
 # Lot sizes match the current NSE exchange values (NIFTY=65, BANKNIFTY=30).
 # Update here AND in configs/default.yaml if the exchange bumps lot sizes.
 INDEX_SPECS = {
-    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 65, "max_loss": 3500, "target": 300},
-    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 30, "max_loss": 3500, "target": 300},
+    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 65, "max_loss": 2500, "target": 300},
+    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 30, "max_loss": 2500, "target": 300},
 }
 
 

@@ -72,30 +72,17 @@ SESSION_END = time(15, 15)
 # Strategy risk config — mirrors Codex's "Tight MTM" (the profile that
 # produced the headline +Rs 2.3M BANKNIFTY / +Rs 1.7M NIFTY 2y backtest).
 # Thresholds:
-#   - max_loss = 3500 (cycle force-close if aggregate MTM breaches -3500)
+#   - max_loss = 2500 (cycle force-close if aggregate MTM breaches -2500)
 #   - target   = 300  (cycle force-close once aggregate MTM crosses +300)
-#   - lock&trail activates at peak>=500, initial floor 350, ratchets 1:1
-#     per +100 of additional peak profit.
 # Override any of these at the CLI to A/B.
+# Lock-and-trail was evaluated and removed (2026-04): it did not improve
+# P&L vs the plain max_loss/target pair in the 2y backtest.
 # Lot sizes match the current NSE exchange values (NIFTY=65, BANKNIFTY=30).
 # Update here AND in configs/default.yaml if the exchange bumps lot sizes.
 INDEX_SPECS = {
-    "NIFTY":     {"strike_interval": 50,  "lot_size": 65, "max_loss": 3500, "target": 300},
-    "BANKNIFTY": {"strike_interval": 100, "lot_size": 30, "max_loss": 3500, "target": 300},
+    "NIFTY":     {"strike_interval": 50,  "lot_size": 65, "max_loss": 2500, "target": 300},
+    "BANKNIFTY": {"strike_interval": 100, "lot_size": 30, "max_loss": 2500, "target": 300},
 }
-
-# Lock-and-trail: protects peak profit via a ratcheting floor.
-# Activation: peak_mtm >= LOCK_START (else no floor).
-# Floor formula (see Codex spread_lab.py:1264-1276):
-#   extra_steps = (peak_mtm - LOCK_START) // TRAIL_STEP_PROFIT
-#   lock_floor  = LOCK_PROFIT + extra_steps * TRAIL_LOCK_STEP
-# With the Tight defaults that works out to lock_floor = peak_mtm - 150
-# once peak >= 500: every Rs 100 of additional peak profit ratchets the
-# floor up Rs 100, so profit is protected with a 150-rupee buffer.
-LOCK_START_RUPEES = 500.0
-LOCK_PROFIT_RUPEES = 350.0
-TRAIL_STEP_PROFIT_RUPEES = 100.0
-TRAIL_LOCK_STEP_RUPEES = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -655,32 +642,16 @@ def simulate_session(
             #    a new leg enters or the cycle-done check below breaks.
             any_active = any(leg.status == "ACTIVE" for leg in legs)
             if any_active:
-                # 5) Lock & trail — compute the protective floor based on
-                #    peak_mtm so far. Mirror of Codex spread_lab.py:1264-1276.
-                #    Once peak has cleared LOCK_START, the floor ratchets up
-                #    with peak so winners can't round-trip back to zero.
-                lock_floor: float | None = None
-                if peak_mtm >= LOCK_START_RUPEES:
-                    extra_steps = int(
-                        max(0.0, peak_mtm - LOCK_START_RUPEES)
-                        // TRAIL_STEP_PROFIT_RUPEES
-                    )
-                    lock_floor = (
-                        LOCK_PROFIT_RUPEES + extra_steps * TRAIL_LOCK_STEP_RUPEES
-                    )
-
-                # 6) Exit checks — priority order mirrors Codex exactly:
+                # 5) Exit checks — priority order:
                 #    SESSION_CLOSE (handled above) > MTM_MAX_LOSS >
-                #    MTM_TARGET > LOCK_TRAIL.
+                #    MTM_TARGET. Lock-and-trail was removed (2026-04) after
+                #    it failed to improve 2y P&L vs plain max_loss/target.
                 if mtm <= -abs(spec["max_loss"]):
                     cycle_exit_reason = "MTM_MAX_LOSS"
                     break
                 target = spec.get("target")
                 if target is not None and mtm >= target:
                     cycle_exit_reason = "MTM_TARGET"
-                    break
-                if lock_floor is not None and mtm <= lock_floor:
-                    cycle_exit_reason = "LOCK_TRAIL"
                     break
 
             # 7) Cycle-done check — a cycle is "done" when there are no
@@ -1113,15 +1084,10 @@ def main() -> int:
                          "contract). Use only to measure the fix's impact.")
     ap.add_argument("--max-loss", type=float, default=None,
                     help="Override INDEX_SPECS[*]['max_loss'] for both indices. "
-                         "Codex Tight=3500.")
+                         "Default 2500.")
     ap.add_argument("--target", type=float, default=None,
                     help="Override INDEX_SPECS[*]['target']. Pass 0 to disable "
-                         "(letting winners run to lock&trail / EOD). Codex "
-                         "Tight has no target.")
-    ap.add_argument("--no-lock-trail", action="store_true",
-                    help="Disable the lock-and-trail floor entirely, so cycles "
-                         "can only exit via SL / target / session-close. Use to "
-                         "measure lock&trail's contribution.")
+                         "(letting winners run to EOD). Default 300.")
     ap.add_argument("--trace-day", default=None,
                     help="YYYY-MM-DD — after the replay, print a per-leg trade "
                          "table for that session (columns mirror Codex's "
@@ -1152,16 +1118,12 @@ def main() -> int:
 
     # CLI overrides for risk config. Mutates the module-level dict; fine
     # because each invocation is one-shot.
-    global LOCK_START_RUPEES  # noqa: PLW0603
     if args.max_loss is not None:
         for k in INDEX_SPECS:
             INDEX_SPECS[k]["max_loss"] = float(args.max_loss)
     if args.target is not None:
         for k in INDEX_SPECS:
             INDEX_SPECS[k]["target"] = None if args.target <= 0 else float(args.target)
-    if args.no_lock_trail:
-        # Set lock_start absurdly high so the activation check never fires.
-        LOCK_START_RUPEES = float("inf")
 
     repo_root = Path(__file__).resolve().parent.parent
     if args.cache_root:
@@ -1277,20 +1239,19 @@ def _print_sweep_report(
 
     print("## P&L vs leg-SL slippage (all indices combined)\n")
     print("| Slip (bps) | Cycles | Win % | Total P&L | Avg P&L | Best cycle | Worst cycle "
-          "| TARGET % | LOCK_TRAIL % | MAX_LOSS % | CLOSE % |")
-    print("|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+          "| TARGET % | MAX_LOSS % | CLOSE % |")
+    print("|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for slip_bps, cycles, _stats in rows:
         s = _summarise(cycles)
         by_reason = _group(cycles, lambda c: c.exit_reason)
         n = max(1, len(cycles))
         pct_target = len(by_reason.get("MTM_TARGET", [])) / n * 100.0
-        pct_lock = len(by_reason.get("LOCK_TRAIL", [])) / n * 100.0
         pct_max_loss = len(by_reason.get("MTM_MAX_LOSS", [])) / n * 100.0
         pct_close = len(by_reason.get("SESSION_CLOSE", [])) / n * 100.0
         print(f"| {slip_bps} | {s['n']} | {s['win_rate']:.1f}% "
               f"| {_fmt_inr(s['pnl'])} | {_fmt_inr(s['avg'])} "
               f"| {_fmt_inr(s['best'])} | {_fmt_inr(s['worst'])} "
-              f"| {pct_target:.1f}% | {pct_lock:.1f}% | {pct_max_loss:.1f}% | {pct_close:.1f}% |")
+              f"| {pct_target:.1f}% | {pct_max_loss:.1f}% | {pct_close:.1f}% |")
 
     # Per-index breakdown
     print("\n## P&L vs slippage by index\n")

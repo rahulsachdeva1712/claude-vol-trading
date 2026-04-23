@@ -47,7 +47,7 @@ authoritative specification for the development team.
 - **Cycle**: One complete entry-to-exit sequence from entry through MTM or SL close.
 - **MTM**: Mark-to-Market — real-time unrealised P&L for all open legs in the cycle.
 - **Leg SL**: Individual option leg stop-loss, calculated from leg entry price.
-- **Lock & Trail**: Protective profit-floor ratchet on cycle MTM. Once `peak_mtm >= lock_start`, a floor is armed at `lock_profit` and moves up by `trail_lock_step` for every full `trail_step` of additional peak progression. If aggregate MTM falls back through the floor, the cycle force-closes with `LOCK_TRAIL` as the exit reason. See §5.2.
+- **Lock & Trail**: *(removed 2026-04)* Evaluated as a protective profit-floor ratchet on cycle MTM; did not improve P&L vs the plain `max_loss`/`target` pair in the 2y backtest and was stripped from all surfaces. Kept here for glossary completeness only.
 - **Momentum Filter**: Minimum candle return required on the option's own bar before a leg entry is triggered.
 - **Bar**: One OHLCV candle on the options data feed; minimum engine granularity.
 
@@ -85,7 +85,7 @@ risk controls.
 | Lot Size (NSE)         | 65               | 30               |
 | Momentum Threshold     | 1% per bar       | 1% per bar       |
 | Lazy Mode              | Enabled          | Enabled          |
-| MTM Risk Profile       | max_loss=Rs.3500, target=Rs.300, lock&trail (500/350/100/100) | max_loss=Rs.3500, target=Rs.300, lock&trail (500/350/100/100) |
+| MTM Risk Profile       | max_loss=Rs.2500, target=Rs.300 | max_loss=Rs.2500, target=Rs.300 |
 | Base Leg SL            | 15% below entry  | 15% below entry  |
 | Lazy Leg SL            | 12% below entry  | 12% below entry  |
 | Session Close          | 15:15            | 15:15            |
@@ -196,45 +196,30 @@ of **all legs in the current cycle** (realised P&L of stopped legs +
 unrealised P&L of open legs). A single aggregate breach closes the
 whole cycle at once, at the bar close of the triggering minute.
 
-The cycle has three thresholds evaluated in priority order: `max_loss`
-(hard stop), `target` (take-profit), and `lock_trail` (a profit-floor
-ratchet that arms once peak MTM clears `lock_start`). The thresholds
-below mirror Codex's "Tight MTM" profile from `spread_lab.py` — the
-configuration the 2y replay is validated against.
+The cycle has two thresholds evaluated in priority order: `max_loss`
+(hard stop) and `target` (take-profit).
 
 **NIFTY**
 
-| Control    | Value    | Behaviour                                                                                  |
-|------------|----------|--------------------------------------------------------------------------------------------|
-| Max Loss   | Rs.3500  | Exit all legs when cycle MTM <= -Rs.3500                                                   |
-| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300                                                    |
-| Lock Start | Rs.500   | Arm lock&trail once peak cycle MTM >= Rs.500                                               |
-| Lock Profit| Rs.350   | Initial protective floor when armed                                                        |
-| Trail Step | Rs.100   | Raise floor every full Rs.100 of peak MTM beyond Lock Start                                 |
-| Trail Lock | Rs.100   | Amount to raise the floor per step (1:1 ratchet with peak progression beyond Lock Start)    |
+| Control    | Value    | Behaviour                                      |
+|------------|----------|------------------------------------------------|
+| Max Loss   | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500       |
+| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300        |
 
 **BANKNIFTY**
 
-| Control    | Value    | Behaviour                                                                                  |
-|------------|----------|--------------------------------------------------------------------------------------------|
-| Max Loss   | Rs.3500  | Exit all legs when cycle MTM <= -Rs.3500                                                   |
-| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300                                                    |
-| Lock Start | Rs.500   | Arm lock&trail once peak cycle MTM >= Rs.500                                               |
-| Lock Profit| Rs.350   | Initial protective floor when armed                                                        |
-| Trail Step | Rs.100   | Raise floor every full Rs.100 of peak MTM beyond Lock Start                                 |
-| Trail Lock | Rs.100   | Amount to raise the floor per step (1:1 ratchet with peak progression beyond Lock Start)    |
+| Control    | Value    | Behaviour                                      |
+|------------|----------|------------------------------------------------|
+| Max Loss   | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500       |
+| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300        |
 
-**Lock-and-trail formula** (Codex `spread_lab.py:1264-1287`):
-
-    if peak_mtm >= lock_start:
-        extra_steps = (peak_mtm - lock_start) // trail_step
-        lock_floor  = lock_profit + extra_steps * trail_lock_step
-        if mtm <= lock_floor:
-            exit(LOCK_TRAIL)
-
-With Tight defaults, once peak >= Rs.500 the floor sits at Rs.350 and
-every additional Rs.100 of peak progression lifts it by Rs.100 — so
-peak-to-floor stays a constant Rs.150 once armed.
+**Lock-and-trail was evaluated and removed (2026-04).** A ratcheting
+profit-floor was previously wired in mirroring Codex's "Tight MTM"
+profile (`spread_lab.py`), but it did not improve P&L vs the plain
+`max_loss`/`target` pair in the 2y backtest. The four knobs
+(`lock_start`, `lock_profit`, `trail_step`, `trail_lock_step`) and the
+`ExitReason.LOCK_TRAIL` enum value have been removed from configs,
+models, the paper/live engine, and both backtest scripts.
 
 **Aggregate-MTM semantics (important):**
 
@@ -259,11 +244,10 @@ peak-to-floor stays a constant Rs.150 once armed.
 ### 5.4 Exit Priority Order
 When multiple exit conditions could apply simultaneously, priority is:
 1. Kill switch (live only — disarms + flattens all live cycles)
-2. Session close at 15:15 (always overrides 3-6)
+2. Session close at 15:15 (always overrides 3-5)
 3. Overall MTM max loss breached (`MTM_MAX_LOSS`)
 4. Overall MTM target reached (`MTM_TARGET`)
-5. Lock-and-trail floor breached once armed (`LOCK_TRAIL`)
-6. Individual leg SL hit (`LEG_SL` — exits only that leg, cycle continues)
+5. Individual leg SL hit (`LEG_SL` — exits only that leg, cycle continues)
 
 ---
 
@@ -410,18 +394,15 @@ intended — paper is an idealised twin, not a strict mirror.
 | lots_per_trade_live    | 1       | Lots per leg — live engines (UI-editable per mode)    |
 
 ### 9.2 MTM Profile Parameters
-| Parameter        | NIFTY    | BANKNIFTY | Description                                                          |
-|------------------|----------|-----------|----------------------------------------------------------------------|
-| max_loss         | Rs.3500  | Rs.3500   | Max cycle loss — force-close when cycle MTM <= -max_loss             |
-| target           | Rs.300   | Rs.300    | Cycle profit target — force-close when cycle MTM >= target           |
-| lock_start       | Rs.500   | Rs.500    | Peak MTM threshold that arms the lock&trail ratchet                  |
-| lock_profit      | Rs.350   | Rs.350    | Initial protective floor when lock&trail arms                        |
-| trail_step       | Rs.100   | Rs.100    | Peak-MTM step size beyond `lock_start` that drives each floor ratchet |
-| trail_lock_step  | Rs.100   | Rs.100    | Floor-raise per `trail_step` of additional peak progression          |
+| Parameter        | NIFTY    | BANKNIFTY | Description                                                |
+|------------------|----------|-----------|------------------------------------------------------------|
+| max_loss         | Rs.2500  | Rs.2500   | Max cycle loss — force-close when cycle MTM <= -max_loss   |
+| target           | Rs.300   | Rs.300    | Cycle profit target — force-close when cycle MTM >= target |
 
-Set any of the four lock fields to `null` in YAML to disable lock&trail
-(the first three thresholds still apply). The `ExitReason.LOCK_TRAIL`
-enum value is emitted when the floor is breached.
+Lock-and-trail fields (`lock_start`, `lock_profit`, `trail_step`,
+`trail_lock_step`) and the `ExitReason.LOCK_TRAIL` enum value were
+removed in 2026-04 after backtesting showed no P&L improvement over the
+plain `max_loss`/`target` pair.
 
 ---
 
