@@ -34,7 +34,6 @@ class DhanClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
-            http2=True,
         )
 
     async def close(self) -> None:

@@ -1,12 +1,15 @@
 """FastAPI dashboard app.
 
 Endpoints:
-    GET  /                — static SPA (index.html)
-    GET  /api/status      — snapshot of KPIs + current cycles
-    POST /api/mode        — switch paper/live
-    POST /api/kill        — kill switch (force close + halt entries)
-    POST /api/config      — update runtime params (lots_per_trade, etc.)
-    WS   /ws              — push stream of engine events
+    GET  /                         — static SPA (index.html)
+    GET  /api/status               — snapshot of both modes
+    GET  /api/closed_trades?mode=  — closed cycles for one mode
+    POST /api/config               — runtime params (per-mode lots_per_trade)
+    POST /api/live/arm             — arm live entries (requires 'confirm': true)
+    POST /api/live/disarm          — disarm live entries
+    POST /api/live/kill            — kill switch: disarm + flatten live
+    POST /api/live/kill/clear      — clear kill flag after manual review
+    WS   /ws                       — push stream of engine events
 """
 from __future__ import annotations
 
@@ -21,7 +24,6 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import Mode
 from ..logging_setup import get_logger
-from .event_bus import EventBus
 
 log = get_logger(__name__)
 
@@ -46,24 +48,43 @@ def create_app(state) -> FastAPI:
     async def status() -> dict[str, Any]:
         return state.snapshot()
 
-    @app.post("/api/mode")
-    async def set_mode(req: Request) -> dict[str, Any]:
-        body = await req.json()
-        new = str(body.get("mode", "")).lower()
-        if new not in ("paper", "live"):
-            raise HTTPException(400, "mode must be 'paper' or 'live'")
-        if new == "live" and not body.get("confirm"):
-            raise HTTPException(400, "live mode requires 'confirm': true")
-        await state.set_mode(Mode(new))
-        return {"mode": new}
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        """Diagnostic counters — useful to confirm the feed is live and
+        signals are being evaluated even when no cycles have fired yet."""
+        md = state.market_data
+        feed = state.feed
+        out: dict[str, Any] = {
+            "feed_connected": bool(feed and getattr(feed, "_ws", None)),
+            "feed_subscriptions": len(getattr(feed, "_subscriptions", set())) if feed else 0,
+            "feed_first_tick_seen": bool(getattr(feed, "_first_tick_logged", False)) if feed else False,
+            "ticks_total": getattr(md, "ticks_total", 0) if md else 0,
+            "bars_closed_total": getattr(md, "bars_closed_total", 0) if md else 0,
+            "unique_securities_seen": len(getattr(md, "_unique_securities", set())) if md else 0,
+            "spots": {k: round(v, 2) for k, v in (getattr(md, "_spot_by_name", {}) or {}).items() if v > 0},
+            "engines": {},
+        }
+        for m, tree in state.modes.items():
+            for idx, eng in tree.engines.items():
+                out["engines"][f"{m.value}-{idx.value}"] = {
+                    "armed": eng.armed.is_set(),
+                    "cycle_no": eng.cycle_counter,
+                    "has_open_cycle": eng.current_cycle is not None,
+                    "cycle_state": eng.current_cycle.state.value if eng.current_cycle else None,
+                    "expiry": eng.expiry,
+                }
+        return out
 
-    @app.post("/api/kill")
-    async def kill(req: Request) -> dict[str, Any]:
-        body = await req.json() if req.headers.get("content-length") else {}
-        if state.cfg.dashboard.kill_switch_require_confirm and not body.get("confirm"):
-            raise HTTPException(400, "kill switch requires 'confirm': true")
-        await state.trigger_kill_switch()
-        return {"killed": True}
+    @app.get("/api/closed_trades")
+    async def closed_trades(mode: str = "paper") -> dict[str, Any]:
+        mode_l = mode.lower()
+        if mode_l not in ("paper", "live"):
+            raise HTTPException(400, "mode must be 'paper' or 'live'")
+        m = Mode(mode_l)
+        if m not in state.modes:
+            return {"mode": mode_l, "trades": []}
+        rows = await state.db.fetch_closed_trades(state.modes[m].session_id)
+        return {"mode": mode_l, "trades": rows}
 
     @app.post("/api/config")
     async def update_config(req: Request) -> dict[str, Any]:
@@ -71,11 +92,42 @@ def create_app(state) -> FastAPI:
         changed = await state.update_runtime_config(body)
         return {"updated": changed}
 
+    @app.post("/api/live/arm")
+    async def live_arm(req: Request) -> dict[str, Any]:
+        body = await req.json() if req.headers.get("content-length") else {}
+        if state.cfg.dashboard.live_mode_require_confirm and not body.get("confirm"):
+            raise HTTPException(400, "live arm requires 'confirm': true")
+        try:
+            await state.arm_live()
+        except RuntimeError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"armed": True}
+
+    @app.post("/api/live/disarm")
+    async def live_disarm() -> dict[str, Any]:
+        await state.disarm_live()
+        return {"armed": False}
+
+    @app.post("/api/live/kill")
+    async def live_kill(req: Request) -> dict[str, Any]:
+        body = await req.json() if req.headers.get("content-length") else {}
+        if state.cfg.dashboard.kill_switch_require_confirm and not body.get("confirm"):
+            raise HTTPException(400, "kill switch requires 'confirm': true")
+        try:
+            await state.trigger_kill_switch()
+        except RuntimeError as e:
+            raise HTTPException(400, str(e)) from e
+        return {"killed": True}
+
+    @app.post("/api/live/kill/clear")
+    async def live_kill_clear() -> dict[str, Any]:
+        await state.clear_kill_switch()
+        return {"killed": False}
+
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()
         q: asyncio.Queue = state.bus.subscribe()
-        # Send initial snapshot.
         try:
             await ws.send_text(json.dumps({"kind": "snapshot", "payload": state.snapshot()}))
             while True:

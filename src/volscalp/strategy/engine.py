@@ -1,12 +1,20 @@
 """Strategy engine — Repeated OTM Strangle.
 
-One engine instance per underlying (NIFTY, BANKNIFTY). All engines run
-on the same asyncio loop and share the MarketDataService / OrderManager.
+One engine instance per (mode, underlying) pair. With paper and live both
+running simultaneously, that's four engines per process (paper-NIFTY,
+paper-BANKNIFTY, live-NIFTY, live-BANKNIFTY). They share the market-data
+service and instrument master; everything else — cycles, MTM, P&L,
+session id — is per-engine.
 
 Hot path:
     tick → update leg last_price → recompute cycle MTM → MtmController
-    bar close → entry evaluation (momentum) → place orders
-    leg SL hit (per-bar) → exit that leg → maybe schedule lazy leg
+    bar close → entry evaluation (momentum) for BASE legs → place orders
+    leg SL hit (per-bar) → exit that leg → immediately enter opposite lazy
+        leg (no momentum gate — Codex aggregate-MTM semantics)
+    cycle aggregate MTM (realized + unrealized) crosses target/max_loss
+        → force-close remaining ACTIVE legs
+    last surviving leg exits and no lazy is pending → cycle is "done"
+        → next cycle spins up on the next bar
     session close → force-close everything
 
 Every decision is timestamped and (best-effort) logged to the DB via the
@@ -19,7 +27,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from ..broker.instruments import InstrumentMaster
-from ..config import AppConfig, IndexName, MtmProfile
+from ..config import AppConfig, IndexName, Mode, MtmProfile
 from ..logging_setup import get_logger
 from ..market_data.feed import MarketDataService
 from ..models import (
@@ -43,31 +51,40 @@ log = get_logger(__name__)
 
 
 class StrategyEngine:
-    """One engine per underlying."""
+    """One engine per (mode, underlying)."""
 
     def __init__(
         self,
+        mode: Mode,
         underlying: IndexName,
         cfg: AppConfig,
         market_data: MarketDataService,
         instruments: InstrumentMaster,
         order_mgr: OrderManager,
         db: Database,
+        session_id: int,
         kill_switch: asyncio.Event,
+        armed: asyncio.Event,
         event_bus,   # EventBus - kept duck-typed to avoid import cycle
+        lots_provider,  # callable() -> int, read at cycle start
     ):
+        self.mode = mode
         self.underlying = underlying
         self.cfg = cfg
         self.md = market_data
         self.instruments = instruments
         self.orders = order_mgr
         self.db = db
+        self.session_id = session_id
         self.kill = kill_switch
+        self.armed = armed
         self.bus = event_bus
+        self._lots_provider = lots_provider
 
         self.profile: MtmProfile = cfg.mtm_profiles[underlying]
         self.inst_cfg = cfg.instruments[underlying]
         self.tz = ZoneInfo(cfg.session.timezone)
+        self.tag = f"{mode.value}:{underlying.value}"
 
         self.current_cycle: Cycle | None = None
         self.current_cycle_row_id: int | None = None
@@ -83,8 +100,8 @@ class StrategyEngine:
         self._mtm_ctrl: MtmController | None = None
         self._stop = asyncio.Event()
 
-        md.on_bar_close(self._on_bar_close)
-        md.on_tick(self._on_tick)
+        self.md.on_bar_close(self._on_bar_close)
+        self.md.on_tick(self._on_tick)
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -94,20 +111,25 @@ class StrategyEngine:
     async def run(self) -> None:
         """Engine driver — pumps the cycle state machine on a 1-second tick."""
         self.expiry = self.instruments.pick_expiry(self.underlying, self.cfg.expiry)
-        log.info("engine_started", underlying=self.underlying.value, expiry=self.expiry,
-                 profile=self.profile.profile)
+        log.info(
+            "engine_started",
+            tag=self.tag,
+            underlying=self.underlying.value,
+            mode=self.mode.value,
+            expiry=self.expiry,
+        )
 
         while not self._stop.is_set():
             try:
                 await self._tick_engine()
             except Exception as e:  # noqa: BLE001
-                log.exception("engine_tick_error", error=str(e))
+                log.exception("engine_tick_error", tag=self.tag, error=str(e))
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
-        log.info("engine_stopped", underlying=self.underlying.value)
+        log.info("engine_stopped", tag=self.tag, underlying=self.underlying.value)
 
     # ---- state machine -----------------------------------------------------
 
@@ -130,20 +152,78 @@ class StrategyEngine:
         if before_start:
             return  # warmup
 
+        # Live engines don't open new cycles until the user arms them from
+        # the dashboard. Already-open cycles continue to be managed (so
+        # disarming during a cycle does NOT halt MTM / SL evaluation — the
+        # kill switch is the escape hatch for that).
+        if not self.armed.is_set() and self.current_cycle is None:
+            return
+
         if self.current_cycle is None:
             await self._start_new_cycle()
             return
 
+        # Cycle-done detector (aggregate-MTM semantics — FRD §5.2 / §6.1):
+        # If every leg in the current cycle has already stopped (or was
+        # never filled) and nothing is still WATCHING for a momentum
+        # entry, the cycle is done — close it and let the next tick spin
+        # up a new one (cooldown=0). Without this, a cycle where both
+        # bases SL out and no lazy is eligible would idle all the way to
+        # session close, blocking further cycles for the day. This
+        # matches the behaviour of scripts/backtest_2y.py's cycle-done
+        # break (see §5-7 of simulate_session).
+        if (
+            self.current_cycle.state != CycleState.CLOSED
+            and self._cycle_is_done(self.current_cycle)
+        ):
+            reason = self._last_leg_exit_reason(self.current_cycle) or ExitReason.LEG_SL
+            await self._force_close_all(reason)
+
         # If the current cycle is fully closed, open the next (cooldown = 0).
         if self.current_cycle.state == CycleState.CLOSED:
             self.current_cycle = None
-            if not after_close:
+            if not after_close and self.armed.is_set():
                 await self._start_new_cycle()
+
+    @staticmethod
+    def _cycle_is_done(cycle) -> bool:
+        """True when no leg is still alive — i.e. everyone is STOPPED or
+        EMPTY, with at least one leg actually in a terminal state (so a
+        cycle that just started with only EMPTY slots from a missing
+        strike chain also returns True and gets re-opened quickly)."""
+        has_alive = any(
+            leg.status in (LegStatus.WATCHING, LegStatus.PENDING,
+                           LegStatus.ACTIVE, LegStatus.EXITING)
+            for leg in cycle.legs.values()
+        )
+        if has_alive:
+            return False
+        has_any_leg = bool(cycle.legs)
+        return has_any_leg
+
+    @staticmethod
+    def _last_leg_exit_reason(cycle) -> ExitReason | None:
+        """Return the exit reason of the most recently stopped leg.
+        Used to label a cycle that ran out of alive legs with the same
+        reason the last leg reported (e.g. LEG_SL if the final leg SL'd
+        out). Mirrors Codex spread_lab.py:1360."""
+        stopped = [leg for leg in cycle.legs.values()
+                   if leg.status == LegStatus.STOPPED and leg.exit_bar_ts]
+        if not stopped:
+            return None
+        stopped.sort(key=lambda leg: leg.exit_bar_ts, reverse=True)
+        return stopped[0].exit_reason
 
     async def _start_new_cycle(self) -> None:
         spot = self.md.spot(self.underlying.value)
         if spot <= 0:
-            # Wait until we have a spot quote.
+            # Wait until we have a spot quote. Log at DEBUG-ish cadence
+            # (once every ~30s) to prove the engine is polling, not stuck.
+            now_mono = int(datetime.now(timezone.utc).timestamp())
+            last = getattr(self, "_last_waiting_spot_log", 0)
+            if now_mono - last >= 30:
+                log.info("waiting_for_spot", tag=self.tag, underlying=self.underlying.value)
+                self._last_waiting_spot_log = now_mono
             return
 
         atm = self.instruments.nearest_strike(
@@ -166,9 +246,10 @@ class StrategyEngine:
 
         self.current_cycle = cycle
         self._mtm_ctrl = MtmController(self.profile)
-        self.current_cycle_row_id = await self.db.insert_cycle(cycle)
+        self.current_cycle_row_id = await self.db.insert_cycle(self.session_id, cycle)
         log.info(
             "cycle_start",
+            tag=self.tag,
             cycle=cycle.cycle_id,
             underlying=cycle.underlying,
             spot=spot,
@@ -179,9 +260,9 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "atm": atm, "spot": spot,
-             "legs": self._legs_snapshot()},
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "atm": atm, "spot": spot, "legs": self._legs_snapshot()},
         )
 
         # Subscribe the MarketDataService's WS to the option instruments for this cycle.
@@ -195,7 +276,7 @@ class StrategyEngine:
             underlying=self.underlying.value,
             strike=strike,
             status=LegStatus.WATCHING,
-            lots=self.cfg.engine.lots_per_trade,
+            lots=max(1, int(self._lots_provider())),
             lot_size=self.inst_cfg.lot_size,
             expiry=self.expiry,
         )
@@ -244,24 +325,41 @@ class StrategyEngine:
                 continue
             if leg.status != LegStatus.WATCHING:
                 continue
-            if bar.return_pct >= self.cfg.engine.momentum_threshold_pct:
+            ret_pct = round(bar.return_pct, 3)
+            threshold = self.cfg.engine.momentum_threshold_pct
+            if bar.return_pct >= threshold:
+                log.info(
+                    "entry_signal",
+                    tag=self.tag, slot=leg.slot,
+                    option_type=leg.option_type.value, strike=leg.strike,
+                    ret_pct=ret_pct, threshold=threshold, bar_close=bar.close,
+                )
                 await self._enter_leg(leg, bar)
             else:
+                log.info(
+                    "entry_skip",
+                    tag=self.tag, slot=leg.slot,
+                    option_type=leg.option_type.value, strike=leg.strike,
+                    ret_pct=ret_pct, threshold=threshold,
+                )
                 await self.db.log_decision(
+                    self.session_id,
                     self.current_cycle_row_id,
                     "entry_eval",
-                    {"slot": leg.slot, "ret_pct": round(bar.return_pct, 3)},
+                    {"slot": leg.slot, "ret_pct": ret_pct},
                     "SKIP",
                 )
 
-        # SL check for ACTIVE legs (close-based per FRD default).
+        # SL check for ACTIVE legs. Default ref price is bar.low (intrabar
+        # trigger; matches Codex's simulate_strategy_day + backtest_2y). Set
+        # engine.sl_price_source=close in YAML for end-of-bar simulation.
         for leg in list(cycle.legs.values()):
             if leg.security_id != bar.security_id or leg.status != LegStatus.ACTIVE:
                 continue
             ref_price = bar.close if self.cfg.engine.sl_price_source == "close" else bar.low
             if ref_price <= leg.sl_price:
                 await self._exit_leg(leg, ref_price, ExitReason.LEG_SL)
-                await self._maybe_schedule_lazy_leg(leg)
+                await self._maybe_schedule_lazy_leg(leg, bar)
 
         # Cycle-level MTM re-evaluation.
         await self._evaluate_mtm()
@@ -297,7 +395,7 @@ class StrategyEngine:
 
         if self.current_cycle_row_id is not None:
             leg.row_id = await self.db.insert_leg(self.current_cycle_row_id, leg)
-            await self.db.record_order_request(req, self.current_cycle_row_id, leg.row_id)
+            await self.db.record_order_request(self.session_id, req, self.current_cycle_row_id, leg.row_id)
 
         report = await self.orders.place(req)
         if report.status == "FILLED":
@@ -314,8 +412,9 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "leg_update",
-            {"underlying": self.underlying.value, "cycle": self.current_cycle.cycle_id,
-             "slot": leg.slot, "status": leg.status.value,
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": self.current_cycle.cycle_id, "slot": leg.slot,
+             "status": leg.status.value,
              "entry_price": leg.entry_price, "sl": leg.sl_price},
         )
 
@@ -353,6 +452,7 @@ class StrategyEngine:
 
         log.info(
             "leg_exit",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=self.current_cycle.cycle_id if self.current_cycle else None,
             slot=leg.slot,
@@ -362,13 +462,20 @@ class StrategyEngine:
         )
         await self.bus.broadcast(
             "leg_update",
-            {"underlying": self.underlying.value,
+            {"mode": self.mode.value, "underlying": self.underlying.value,
              "cycle": self.current_cycle.cycle_id if self.current_cycle else None,
              "slot": leg.slot, "status": leg.status.value,
              "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
         )
 
-    async def _maybe_schedule_lazy_leg(self, stopped: Leg) -> None:
+    async def _maybe_schedule_lazy_leg(self, stopped: Leg, bar: Bar) -> None:
+        """Enter the lazy (opposite-side OTM) leg at the stop-minute bar close.
+
+        Codex semantics: lazy leg goes ACTIVE immediately when the base leg
+        stops — there is no subsequent momentum-gate wait. The entry price is
+        the current (stop-minute) close of the lazy instrument; if we have no
+        fresh bar for it yet we fall back to the last known LTP.
+        """
         cycle = self.current_cycle
         if not cycle or not self.cfg.engine.lazy_enabled or stopped.kind != LegKind.BASE:
             return
@@ -398,23 +505,49 @@ class StrategyEngine:
 
         leg = self._new_leg_slot(slot, LegKind.LAZY, opposite, strike)
         inst = self.instruments.get(self.underlying.value, self.expiry, strike, opposite)
-        if inst:
-            leg.security_id = inst.security_id
-            leg.trading_symbol = inst.trading_symbol
-            if not leg.lot_size:
-                leg.lot_size = inst.lot_size
-        else:
+        if not inst:
             log.warning("lazy_leg_strike_missing", strike=strike, option_type=opposite.value)
             leg.status = LegStatus.EMPTY
+            cycle.legs[slot] = leg
+            return
+
+        leg.security_id = inst.security_id
+        leg.trading_symbol = inst.trading_symbol
+        if not leg.lot_size:
+            leg.lot_size = inst.lot_size
         cycle.legs[slot] = leg
+
+        # Build a bar for the lazy instrument at the same stop-minute. Prefer
+        # the live candle builder's in-progress bar; fall back to last LTP
+        # wrapped in a minimal OHLC shell so _enter_leg has a close to use.
+        lazy_bar = self.md.current_bar(leg.security_id)
+        if lazy_bar is None or lazy_bar.close <= 0:
+            px = self.md.last_ltp(leg.security_id)
+            if px <= 0:
+                log.warning(
+                    "lazy_leg_no_price",
+                    slot=slot, strike=strike, option_type=opposite.value,
+                )
+                leg.status = LegStatus.EMPTY
+                return
+            lazy_bar = Bar(
+                security_id=leg.security_id,
+                minute_epoch=bar.minute_epoch,
+                open=px, high=px, low=px, close=px,
+            )
+
         log.info(
             "lazy_leg_scheduled",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=cycle.cycle_id,
             slot=slot,
             strike=strike,
             option_type=opposite.value,
+            entry_price=lazy_bar.close,
         )
+
+        await self._enter_leg(leg, lazy_bar)
 
     # ---- MTM ---------------------------------------------------------------
 
@@ -433,10 +566,10 @@ class StrategyEngine:
 
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "mtm": round(mtm, 2),
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "mtm": round(mtm, 2),
              "peak": round(cycle.peak_mtm, 2), "trough": round(cycle.trough_mtm, 2),
-             "locked": cycle.lock_activated, "floor": round(cycle.lock_floor, 2),
              "legs": self._legs_snapshot()},
         )
 
@@ -460,8 +593,6 @@ class StrategyEngine:
                 cycle.cycle_pnl,
                 cycle.peak_mtm,
                 cycle.trough_mtm,
-                cycle.lock_activated,
-                cycle.lock_floor,
             )
         self.closed_cycles_count += 1
         if cycle.cycle_pnl > 0:
@@ -475,6 +606,7 @@ class StrategyEngine:
 
         log.info(
             "cycle_closed",
+            tag=self.tag,
             underlying=self.underlying.value,
             cycle=cycle.cycle_id,
             reason=reason.value,
@@ -484,9 +616,10 @@ class StrategyEngine:
         )
         await self.bus.broadcast(
             "cycle_update",
-            {"underlying": self.underlying.value, "cycle": cycle.cycle_id,
-             "state": cycle.state.value, "mtm": cycle.cycle_pnl,
-             "exit_reason": reason.value, "legs": self._legs_snapshot(), "closed": True},
+            {"mode": self.mode.value, "underlying": self.underlying.value,
+             "cycle": cycle.cycle_id, "state": cycle.state.value,
+             "mtm": cycle.cycle_pnl, "exit_reason": reason.value,
+             "legs": self._legs_snapshot(), "closed": True},
         )
 
     # ---- UI helpers --------------------------------------------------------
@@ -520,12 +653,12 @@ class StrategyEngine:
             unrealized = sum(leg.unrealized_pnl for leg in self.current_cycle.legs.values())
         total = self.realized_pnl + unrealized
         avg_closed = (self.realized_pnl / self.closed_cycles_count) if self.closed_cycles_count else 0.0
-        winners = [1 for _ in range(self.win_count)]
         total_trades = self.win_count + self.loss_count
         win_rate = (self.win_count / total_trades * 100.0) if total_trades else 0.0
         return {
             "underlying": self.underlying.value,
-            "mode": self.cfg.mode.value,
+            "mode": self.mode.value,
+            "armed": self.armed.is_set(),
             "cycle_no": self.cycle_counter,
             "closed_cycles": self.closed_cycles_count,
             "realized_pnl": round(self.realized_pnl, 2),

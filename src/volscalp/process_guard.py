@@ -34,6 +34,27 @@ _shutdown_callbacks: list[Callable[[], Awaitable[None] | None]] = []
 _shutdown_requested = asyncio.Event()
 
 
+def _self_tree_pids() -> set[int]:
+    """PIDs we must NEVER terminate: self, ancestors (shell/launcher wrappers),
+    descendants (child processes we spawned). Any of these may show up with
+    a cmdline containing ``volscalp`` (e.g. a Windows ``py`` launcher that
+    forwards the full command-line to the real interpreter)."""
+    pids: set[int] = {os.getpid()}
+    try:
+        me = psutil.Process(os.getpid())
+    except psutil.Error:
+        return pids
+    try:
+        pids.update(p.pid for p in me.parents())
+    except psutil.Error:
+        pass
+    try:
+        pids.update(c.pid for c in me.children(recursive=True))
+    except psutil.Error:
+        pass
+    return pids
+
+
 def _is_volscalp_proc(proc: psutil.Process) -> bool:
     """Heuristic: does this process look like a previous volscalp run?"""
     try:
@@ -52,6 +73,9 @@ def _is_volscalp_proc(proc: psutil.Process) -> bool:
 
 def _terminate(proc: psutil.Process, timeout_s: float = 5.0) -> None:
     """SIGTERM, wait, SIGKILL fallback."""
+    if proc.pid == os.getpid():
+        log.error("refused_to_terminate_self", pid=proc.pid)
+        return
     try:
         log.warning("terminating_stale_process", pid=proc.pid, cmdline=" ".join(proc.cmdline()[:4]))
         proc.terminate()
@@ -69,6 +93,8 @@ def _terminate(proc: psutil.Process, timeout_s: float = 5.0) -> None:
 def cleanup_stale_processes(pid_file: Path) -> int:
     """Kill any previous volscalp instances. Returns count of processes killed."""
     killed = 0
+    safe_pids = _self_tree_pids()
+    log.debug("stale_scan_safe_pids", pids=sorted(safe_pids), self_pid=os.getpid())
 
     # 1. PID file check.
     if pid_file.exists():
@@ -78,7 +104,7 @@ def cleanup_stale_processes(pid_file: Path) -> int:
             log.warning("pid_file_corrupt_removing", path=str(pid_file))
             pid_file.unlink(missing_ok=True)
             old_pid = None
-        if old_pid and psutil.pid_exists(old_pid):
+        if old_pid and old_pid not in safe_pids and psutil.pid_exists(old_pid):
             try:
                 proc = psutil.Process(old_pid)
                 if _is_volscalp_proc(proc):
@@ -88,10 +114,9 @@ def cleanup_stale_processes(pid_file: Path) -> int:
                 pass
         pid_file.unlink(missing_ok=True)
 
-    # 2. Broader scan for orphaned workers.
-    current_pid = os.getpid()
+    # 2. Broader scan for orphaned workers — skip self, ancestors, descendants.
     for proc in psutil.process_iter(["pid"]):
-        if proc.pid == current_pid:
+        if proc.pid in safe_pids:
             continue
         if _is_volscalp_proc(proc):
             _terminate(proc)

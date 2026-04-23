@@ -60,6 +60,10 @@ REQ_SUBSCRIBE_QUOTE = 17
 REQ_SUBSCRIBE_DEPTH = 21
 REQ_UNSUBSCRIBE = 16
 
+# Dhan silently drops a subscribe frame if the InstrumentList is too large.
+# Their docs recommend <=100 per frame. Chunk conservatively.
+SUBSCRIBE_CHUNK_SIZE = 100
+
 
 def _subscribe_payload(request_code: int, instruments: list[tuple[str, int]]) -> str:
     """Build a subscribe JSON payload.
@@ -171,6 +175,8 @@ class DhanMarketFeed:
         self._subscriptions: set[tuple[str, int]] = set()
         self._ws: WebSocketClientProtocol | None = None
         self._stop = asyncio.Event()
+        self._first_tick_logged: bool = False
+        self._last_msg_mono: float = 0.0
 
     @property
     def request_code(self) -> int:
@@ -198,7 +204,13 @@ class DhanMarketFeed:
                     f"&clientId={self.client_id}"
                     f"&authType=2"
                 )
-                log.info("dhan_ws_connecting", feed_mode=self.feed_mode, subs=len(self._subscriptions))
+                log.info(
+                    "dhan_ws_connecting",
+                    feed_mode=self.feed_mode,
+                    request_code=self.request_code,
+                    subs=len(self._subscriptions),
+                    client_id=self.client_id,
+                )
                 async with websockets.connect(
                     url,
                     max_size=4 * 1024 * 1024,
@@ -208,14 +220,21 @@ class DhanMarketFeed:
                 ) as ws:
                     self._ws = ws
                     attempt = 0
+                    log.info("dhan_ws_connected")
                     if self._subscriptions:
-                        await ws.send(_subscribe_payload(self.request_code, list(self._subscriptions)))
+                        await self._send_subscribe_chunks(ws, list(self._subscriptions), self.request_code)
+                    else:
+                        log.warning("dhan_ws_no_initial_subscriptions")
                     await self._pump(ws)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 attempt += 1
-                log.warning("dhan_ws_disconnected", error=str(e), next_retry_s=backoff, attempt=attempt)
+                log.warning(
+                    "dhan_ws_disconnected",
+                    error=str(e), error_type=type(e).__name__,
+                    next_retry_s=backoff, attempt=attempt,
+                )
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
                     return
@@ -223,15 +242,29 @@ class DhanMarketFeed:
                     continue
             finally:
                 self._ws = None
+                self._first_tick_logged = False
 
     async def _pump(self, ws: WebSocketClientProtocol) -> None:
+        binary_count = 0
+        parsed_count = 0
         async for msg in ws:
             if self._stop.is_set():
                 break
+            self._last_msg_mono = time.monotonic()
             if isinstance(msg, bytes):
+                binary_count += 1
                 tick = _parse_packet(msg)
                 if tick is not None:
-                    # Non-blocking put; drop oldest on overflow to preserve freshness.
+                    parsed_count += 1
+                    if not self._first_tick_logged:
+                        log.info(
+                            "dhan_ws_first_tick",
+                            security_id=tick.security_id,
+                            segment=tick.exchange_segment,
+                            ltp=tick.ltp,
+                            binary_msgs_before=binary_count,
+                        )
+                        self._first_tick_logged = True
                     try:
                         self.out.put_nowait(tick)
                     except asyncio.QueueFull:
@@ -240,17 +273,52 @@ class DhanMarketFeed:
                             self.out.put_nowait(tick)
                         except asyncio.QueueEmpty:
                             pass
+                elif binary_count <= 3:
+                    # Log a few early unparsed frames so we can diagnose
+                    # protocol drift without flooding the log.
+                    head = msg[:24].hex()
+                    log.info("dhan_ws_binary_unparsed", n=binary_count, head_hex=head, length=len(msg))
             else:
-                log.debug("dhan_ws_text_frame", text=str(msg)[:200])
+                # Dhan sends JSON control/ack frames — surface them, they're
+                # the fastest way to see "invalid token" / "subscription too
+                # large" etc.
+                log.warning("dhan_ws_text_frame", text=str(msg)[:400])
 
     async def subscribe(self, instruments: Iterable[tuple[str, int]]) -> None:
-        new = set(instruments) - self._subscriptions
+        new = list(set(instruments) - self._subscriptions)
         self._subscriptions.update(instruments)
         if self._ws and new:
-            await self._ws.send(_subscribe_payload(self.request_code, list(new)))
+            await self._send_subscribe_chunks(self._ws, new, self.request_code)
 
     async def unsubscribe(self, instruments: Iterable[tuple[str, int]]) -> None:
-        drop = set(instruments) & self._subscriptions
+        drop = list(set(instruments) & self._subscriptions)
         self._subscriptions.difference_update(drop)
         if self._ws and drop:
-            await self._ws.send(_subscribe_payload(REQ_UNSUBSCRIBE, list(drop)))
+            await self._send_subscribe_chunks(self._ws, drop, REQ_UNSUBSCRIBE)
+
+    async def _send_subscribe_chunks(
+        self, ws: WebSocketClientProtocol,
+        instruments: list[tuple[str, int]], request_code: int,
+    ) -> None:
+        """Dhan silently drops subscribe frames with too many instruments.
+        Chunk every outgoing subscribe/unsubscribe by SUBSCRIBE_CHUNK_SIZE."""
+        total = len(instruments)
+        for i in range(0, total, SUBSCRIBE_CHUNK_SIZE):
+            chunk = instruments[i: i + SUBSCRIBE_CHUNK_SIZE]
+            await ws.send(_subscribe_payload(request_code, chunk))
+            log.info(
+                "dhan_ws_subscribe_chunk",
+                request_code=request_code,
+                chunk=i // SUBSCRIBE_CHUNK_SIZE + 1,
+                chunk_size=len(chunk),
+                total=total,
+                sample=chunk[:2],
+            )
+            # Tiny gap so consecutive frames don't coalesce in Dhan's ingress.
+            await asyncio.sleep(0.05)
+        log.info(
+            "dhan_ws_subscribe_complete",
+            request_code=request_code,
+            total=total,
+            chunks=(total + SUBSCRIBE_CHUNK_SIZE - 1) // SUBSCRIBE_CHUNK_SIZE,
+        )

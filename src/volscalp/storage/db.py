@@ -32,7 +32,6 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
-        self._session_id: int | None = None
 
     async def open(self) -> None:
         self._conn = await aiosqlite.connect(self.path)
@@ -50,13 +49,11 @@ class Database:
             self._conn = None
             log.info("db_closed")
 
-    @property
-    def session_id(self) -> int | None:
-        return self._session_id
-
     # ---- sessions ----------------------------------------------------------
 
     async def start_session(self, index_name: str, mode: str) -> int:
+        """Create a session row and return its id. Paper and live each get
+        their own session row per process run."""
         assert self._conn
         async with self._lock:
             cursor = await self._conn.execute(
@@ -64,44 +61,45 @@ class Database:
                 (datetime.now().date().isoformat(), index_name, mode, _utcnow_iso()),
             )
             await self._conn.commit()
-            self._session_id = cursor.lastrowid
-            return self._session_id
+            return cursor.lastrowid
 
-    async def end_session(self, realized_pnl: float, total_cycles: int, peak: float, trough: float) -> None:
-        assert self._conn and self._session_id
+    async def end_session(
+        self, session_id: int, realized_pnl: float, total_cycles: int, peak: float, trough: float
+    ) -> None:
+        assert self._conn
         async with self._lock:
             await self._conn.execute(
                 "UPDATE sessions SET ended_at=?, realized_pnl=?, total_cycles=?, peak_pnl=?, trough_pnl=? WHERE id=?",
-                (_utcnow_iso(), realized_pnl, total_cycles, peak, trough, self._session_id),
+                (_utcnow_iso(), realized_pnl, total_cycles, peak, trough, session_id),
             )
             await self._conn.commit()
 
     # ---- cycles ------------------------------------------------------------
 
-    async def insert_cycle(self, cycle: Cycle) -> int:
-        assert self._conn and self._session_id
+    async def insert_cycle(self, session_id: int, cycle: Cycle) -> int:
+        assert self._conn
         async with self._lock:
             cursor = await self._conn.execute(
                 """INSERT INTO cycles(session_id, cycle_no, underlying, atm_at_start, started_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (self._session_id, cycle.cycle_id, cycle.underlying, cycle.atm_at_start, _utcnow_iso()),
+                (session_id, cycle.cycle_id, cycle.underlying, cycle.atm_at_start, _utcnow_iso()),
             )
             await self._conn.commit()
             return cursor.lastrowid
 
     async def update_cycle_close(
         self, cycle_row_id: int, exit_reason: ExitReason, pnl: float, peak: float, trough: float,
-        lock_activated: bool, lock_floor: float,
     ) -> None:
+        """Close out a cycle row. `lock_activated`/`lock_floor` columns remain
+        in the schema for backward compatibility but are never populated since
+        the lock-and-trail feature was removed."""
         assert self._conn
         async with self._lock:
             await self._conn.execute(
                 """UPDATE cycles
-                   SET ended_at=?, exit_reason=?, cycle_pnl=?, peak_mtm=?, trough_mtm=?,
-                       lock_activated=?, lock_floor=?
+                   SET ended_at=?, exit_reason=?, cycle_pnl=?, peak_mtm=?, trough_mtm=?
                    WHERE id=?""",
-                (_utcnow_iso(), exit_reason.value, pnl, peak, trough,
-                 1 if lock_activated else 0, lock_floor, cycle_row_id),
+                (_utcnow_iso(), exit_reason.value, pnl, peak, trough, cycle_row_id),
             )
             await self._conn.commit()
 
@@ -143,7 +141,10 @@ class Database:
 
     # ---- orders ------------------------------------------------------------
 
-    async def record_order_request(self, req: OrderRequest, cycle_row_id: int | None, leg_row_id: int | None) -> None:
+    async def record_order_request(
+        self, session_id: int | None, req: OrderRequest,
+        cycle_row_id: int | None, leg_row_id: int | None,
+    ) -> None:
         assert self._conn
         async with self._lock:
             await self._conn.execute(
@@ -152,7 +153,7 @@ class Database:
                         status, placed_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
                 (
-                    req.client_order_id, self._session_id, cycle_row_id, leg_row_id,
+                    req.client_order_id, session_id, cycle_row_id, leg_row_id,
                     req.security_id, req.trading_symbol, req.side, req.quantity,
                     req.order_type, req.product_type, _utcnow_iso(),
                 ),
@@ -176,31 +177,37 @@ class Database:
 
     # ---- snapshots / decisions --------------------------------------------
 
-    async def snapshot_bar(self, cycle_row_id: int | None, underlying: str, spot: float, atm: int, payload: dict[str, Any]) -> None:
-        assert self._conn and self._session_id
+    async def snapshot_bar(
+        self, session_id: int, cycle_row_id: int | None, underlying: str,
+        spot: float, atm: int, payload: dict[str, Any],
+    ) -> None:
+        assert self._conn
         async with self._lock:
             await self._conn.execute(
                 """INSERT INTO bar_snapshots(session_id, cycle_id, minute_epoch, underlying, spot, atm, payload_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (self._session_id, cycle_row_id, int(datetime.now().timestamp()) // 60 * 60,
+                (session_id, cycle_row_id, int(datetime.now().timestamp()) // 60 * 60,
                  underlying, spot, atm, json.dumps(payload, default=str)),
             )
             await self._conn.commit()
 
-    async def log_decision(self, cycle_row_id: int | None, kind: str, inputs: dict[str, Any], outcome: str) -> None:
+    async def log_decision(
+        self, session_id: int | None, cycle_row_id: int | None,
+        kind: str, inputs: dict[str, Any], outcome: str,
+    ) -> None:
         assert self._conn
         async with self._lock:
             await self._conn.execute(
                 """INSERT INTO decisions(session_id, cycle_id, ts, kind, inputs_json, outcome)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (self._session_id, cycle_row_id, _utcnow_iso(), kind,
+                (session_id, cycle_row_id, _utcnow_iso(), kind,
                  json.dumps(inputs, default=str), outcome),
             )
             await self._conn.commit()
 
     # ---- read-side ---------------------------------------------------------
 
-    async def fetch_closed_trades_today(self) -> list[dict[str, Any]]:
+    async def fetch_closed_trades(self, session_id: int) -> list[dict[str, Any]]:
         assert self._conn
         async with self._conn.execute(
             """SELECT id, cycle_no, underlying, cycle_pnl, peak_mtm, trough_mtm,
@@ -208,9 +215,40 @@ class Database:
                FROM cycles
                WHERE session_id = ? AND ended_at IS NOT NULL
                ORDER BY id DESC""",
-            (self._session_id,),
+            (session_id,),
         ) as cur:
             rows = await cur.fetchall()
         cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
                 "exit_reason", "started_at", "ended_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def fetch_mode_cumulative_pnl(self, mode_label: str) -> float:
+        """Sum of closed-cycle P&L across every session ever recorded for
+        this mode (paper | live). Survives process restarts."""
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT COALESCE(SUM(c.cycle_pnl), 0)
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.ended_at IS NOT NULL""",
+            (mode_label,),
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
+    async def fetch_closed_trades_all_sessions(self, mode_label: str) -> list[dict[str, Any]]:
+        """Closed cycles across every session for a mode, newest first."""
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT c.id, c.cycle_no, c.underlying, c.cycle_pnl, c.peak_mtm, c.trough_mtm,
+                      c.exit_reason, c.started_at, c.ended_at, s.session_date
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.ended_at IS NOT NULL
+               ORDER BY c.id DESC""",
+            (mode_label,),
+        ) as cur:
+            rows = await cur.fetchall()
+        cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
+                "exit_reason", "started_at", "ended_at", "session_date"]
         return [dict(zip(cols, r)) for r in rows]

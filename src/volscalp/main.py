@@ -1,26 +1,40 @@
 """Application entrypoint — wires every module into a single asyncio process.
 
-Responsibilities:
+Dual-mode topology:
+    Paper and Live engines run SIMULTANEOUSLY in one process. They share:
+        - Dhan market feed (WebSocket)
+        - MarketDataService + candle builder
+        - Instrument master
+
+    They do NOT share:
+        - OrderManager (paper uses LTP fills; live uses Dhan REST)
+        - Strategy engines (one per (mode, underlying) = 4 total)
+        - DB sessions (one row per mode)
+        - Lots-per-trade (per-mode UI input)
+
+    Controls:
+        - Live engines start DISARMED; entries are suppressed until the user
+          clicks "Arm" on the live tab.
+        - Kill switch targets live only: disarms + force-closes live cycles.
+        - Paper has no kill switch (it's always safe) and no arm toggle
+          (it's always armed).
+
+Boot responsibilities:
     1. Process hygiene (PID file, stale cleanup, signal handlers).
     2. Config + secrets load, logging setup.
     3. Dhan instrument master download (or cached).
     4. Dhan WebSocket connection and ATM ± N strike subscription per index.
     5. Market data service + candle builder + spot tracker.
-    6. Order manager (paper or live backend).
-    7. Strategy engines (one per index).
+    6. Two OrderManagers: paper + live (live only if Dhan creds present).
+    7. Four StrategyEngines (paper×2, live×2).
     8. FastAPI dashboard (uvicorn running in the same loop).
-    9. Optional Dhan position reconciler (live mode only).
+    9. Optional Dhan position reconciler (live only).
    10. Graceful shutdown on SIGINT/SIGTERM.
-
-The RuntimeState class is the single object the dashboard talks to — all
-mode switches, kill-switch triggers, and lots-per-trade updates go
-through it.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -62,12 +76,33 @@ INDEX_FEED = {
 PRE_SUBSCRIBE_RANGE = 15
 
 
-class RuntimeState:
-    """Mutable runtime state shared between the dashboard and the engines.
+class ModeTree:
+    """Per-mode container: order manager, engines, session_id, lot size,
+    arm flag. Paper has arm permanently set; live starts disarmed."""
 
-    Anything the UI can change at runtime (mode, lots, kill switch) lives
-    here. Config objects remain frozen — we mirror the dynamic fields in
-    this object and engines read from it on every decision.
+    def __init__(
+        self,
+        mode: Mode,
+        order_mgr: OrderManager,
+        session_id: int,
+        lots: int,
+        armed: asyncio.Event,
+    ):
+        self.mode = mode
+        self.order_mgr = order_mgr
+        self.session_id = session_id
+        self.lots = lots
+        self.armed = armed
+        self.engines: dict[IndexName, StrategyEngine] = {}
+        self.kill_switch: asyncio.Event = asyncio.Event()
+
+
+class RuntimeState:
+    """Shared state between the dashboard and the engines.
+
+    Holds one ModeTree per mode (always paper; live only if Dhan creds
+    present). The dashboard reads `snapshot()` and mutates lots / arm /
+    kill via the provided async methods.
     """
 
     def __init__(
@@ -85,21 +120,26 @@ class RuntimeState:
         self.bus = bus
         self.instruments = instruments
         self.feed = feed
-        self.mode: Mode = cfg.mode
-        self.lots_per_trade: int = cfg.engine.lots_per_trade
-        self.engines: dict[IndexName, StrategyEngine] = {}
         self.market_data: MarketDataService | None = None
         self.reconciler: PositionReconciler | None = None
         self.dhan_client: DhanClient | None = None
-        self.kill_switch: asyncio.Event = asyncio.Event()
-        self._mode_lock = asyncio.Lock()
+        self.modes: dict[Mode, ModeTree] = {}
+        self._arm_lock = asyncio.Lock()
+        # Lifetime P&L per mode, refreshed from SQLite every ~5 s so the
+        # "Cumulative P&L" KPI survives process restarts.
+        self.cumulative_pnl_by_mode: dict[Mode, float] = {}
 
-    def register_engine(self, idx: IndexName, engine: StrategyEngine) -> None:
-        self.engines[idx] = engine
+    # ---- registry --------------------------------------------------------
 
-    # ---- snapshot consumed by /api/status + WS initial payload ----------------
+    def register_mode(self, tree: ModeTree) -> None:
+        self.modes[tree.mode] = tree
 
-    def snapshot(self) -> dict[str, Any]:
+    def has_live(self) -> bool:
+        return Mode.LIVE in self.modes
+
+    # ---- snapshot --------------------------------------------------------
+
+    def _tree_snapshot(self, tree: ModeTree) -> dict[str, Any]:
         engine_kpis: dict[str, dict[str, Any]] = {}
         realized_total = 0.0
         unrealized_total = 0.0
@@ -109,16 +149,14 @@ class RuntimeState:
         peak_total = 0.0
         trough_total = 0.0
 
-        for idx, eng in self.engines.items():
+        for idx, eng in tree.engines.items():
             kpi = eng.kpi_snapshot()
-            kpi["legs"] = eng._legs_snapshot()  # noqa: SLF001 — intentional read
+            kpi["legs"] = eng._legs_snapshot()  # noqa: SLF001
             if eng.current_cycle:
                 kpi["cycle_no"] = eng.current_cycle.cycle_id
                 kpi["state"] = eng.current_cycle.state.value
                 kpi["mtm"] = round(eng.current_cycle.mtm, 2)
                 kpi["atm"] = eng.current_cycle.atm_at_start
-                kpi["locked"] = eng.current_cycle.lock_activated
-                kpi["floor"] = eng.current_cycle.lock_floor
                 if self.market_data:
                     kpi["spot"] = self.market_data.spot(idx.value)
             engine_kpis[idx.value] = kpi
@@ -133,27 +171,29 @@ class RuntimeState:
         total_trades = wins_total + losses_total
         win_rate = (wins_total / total_trades * 100.0) if total_trades else 0.0
 
-        # Profit factor = gross_profit / gross_loss (fallback: from realized).
-        gross_profit = sum(max(0.0, eng.realized_pnl) for eng in self.engines.values() if eng.win_count)
-        gross_loss = abs(sum(min(0.0, eng.realized_pnl) for eng in self.engines.values() if eng.loss_count))
+        gross_profit = sum(max(0.0, e.realized_pnl) for e in tree.engines.values() if e.win_count)
+        gross_loss = abs(sum(min(0.0, e.realized_pnl) for e in tree.engines.values() if e.loss_count))
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0.0
 
         open_positions = sum(
-            1 for eng in self.engines.values()
+            1 for eng in tree.engines.values()
             for leg in (eng.current_cycle.legs.values() if eng.current_cycle else [])
             if leg.status.value == "ACTIVE"
         )
 
         return {
-            "mode": self.mode.value,
-            "lots_per_trade": self.lots_per_trade,
-            "kill_switch": self.kill_switch.is_set(),
+            "mode": tree.mode.value,
+            "armed": tree.armed.is_set(),
+            "kill_switch": tree.kill_switch.is_set(),
+            "lots_per_trade": tree.lots,
             "engines": engine_kpis,
             "aggregate": {
                 "realized_pnl": round(realized_total, 2),
                 "unrealized_pnl": round(unrealized_total, 2),
                 "total_mtm": round(realized_total + unrealized_total, 2),
-                "cumulative_pnl": round(realized_total, 2),
+                # Cumulative across ALL recorded sessions for this mode —
+                # pulled from SQLite, so it persists across restarts.
+                "cumulative_pnl": round(self.cumulative_pnl_by_mode.get(tree.mode, 0.0), 2),
                 "open_positions": open_positions,
                 "closed_cycles": closed_total,
                 "win_rate_pct": round(win_rate, 1),
@@ -163,63 +203,141 @@ class RuntimeState:
             },
         }
 
-    # ---- mutations from dashboard --------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "modes": {m.value: self._tree_snapshot(t) for m, t in self.modes.items()},
+            "live_available": self.has_live(),
+        }
 
-    async def set_mode(self, new_mode: Mode) -> None:
-        async with self._mode_lock:
-            if new_mode == self.mode:
-                return
-            log.warning("runtime_mode_switch_requested", old=self.mode.value, new=new_mode.value)
+    # ---- mutations from dashboard ---------------------------------------
 
-            # Switching into live requires a functioning Dhan client.
-            if new_mode == Mode.LIVE:
-                if not self.secrets.has_dhan_credentials():
-                    raise RuntimeError("DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN missing in .env")
-                if self.dhan_client is None:
-                    self.dhan_client = DhanClient(
-                        self.secrets.DHAN_CLIENT_ID,
-                        self.secrets.DHAN_ACCESS_TOKEN,
-                        timeout_s=self.cfg.broker.order_timeout_s,
-                    )
+    async def arm_live(self) -> None:
+        if Mode.LIVE not in self.modes:
+            raise RuntimeError("live mode is not available (missing Dhan credentials)")
+        async with self._arm_lock:
+            tree = self.modes[Mode.LIVE]
+            if tree.kill_switch.is_set():
+                raise RuntimeError("kill switch is active; clear it before arming")
+            tree.armed.set()
+            log.warning("live_armed")
+            await self.bus.broadcast("live_arm", {"armed": True})
 
-            new_backend = (
-                LiveBackend(self.dhan_client)
-                if new_mode == Mode.LIVE and self.dhan_client is not None
-                else PaperBackend(
-                    price_lookup=(self.market_data.last_ltp if self.market_data else lambda _sid: 0.0),
-                    slippage_bps=self.cfg.paper.slippage_bps,
-                )
-            )
-            for eng in self.engines.values():
-                eng.orders.mode = new_mode
-                eng.orders.backend = new_backend
-            self.mode = new_mode
-            await self.bus.broadcast("mode_change", {"mode": new_mode.value})
+    async def disarm_live(self) -> None:
+        if Mode.LIVE not in self.modes:
+            return
+        async with self._arm_lock:
+            tree = self.modes[Mode.LIVE]
+            tree.armed.clear()
+            log.warning("live_disarmed")
+            await self.bus.broadcast("live_arm", {"armed": False})
 
     async def trigger_kill_switch(self) -> None:
+        """Kill switch is LIVE-ONLY. Disarms + flattens all live positions."""
+        if Mode.LIVE not in self.modes:
+            raise RuntimeError("kill switch only applies to live; live is not available")
         log.warning("kill_switch_triggered")
-        self.kill_switch.set()
+        tree = self.modes[Mode.LIVE]
+        tree.kill_switch.set()
+        tree.armed.clear()
         await self.bus.broadcast("kill_switch", {"active": True})
+
+    async def clear_kill_switch(self) -> None:
+        if Mode.LIVE not in self.modes:
+            return
+        tree = self.modes[Mode.LIVE]
+        tree.kill_switch = asyncio.Event()
+        for eng in tree.engines.values():
+            eng.kill = tree.kill_switch
+        log.warning("kill_switch_cleared")
+        await self.bus.broadcast("kill_switch", {"active": False})
 
     async def update_runtime_config(self, body: dict[str, Any]) -> dict[str, Any]:
         changed: dict[str, Any] = {}
+        mode_str = str(body.get("mode", "")).lower()
+        if mode_str not in ("paper", "live"):
+            raise RuntimeError("config update requires 'mode': 'paper' | 'live'")
+        mode = Mode(mode_str)
+        if mode not in self.modes:
+            raise RuntimeError(f"{mode_str} mode is not available")
+        tree = self.modes[mode]
         if "lots_per_trade" in body:
             try:
                 lots = max(1, int(body["lots_per_trade"]))
             except (TypeError, ValueError):
                 raise RuntimeError("lots_per_trade must be an integer >= 1") from None
-            self.lots_per_trade = lots
-            self.cfg.engine.lots_per_trade = lots
+            tree.lots = lots
             changed["lots_per_trade"] = lots
-            log.info("runtime_lots_updated", lots=lots)
+            log.info("runtime_lots_updated", mode=mode.value, lots=lots)
         if changed:
-            await self.bus.broadcast("runtime_config", changed)
+            await self.bus.broadcast("runtime_config", {"mode": mode.value, **changed})
         return changed
 
 
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
+
+async def _build_mode_tree(
+    mode: Mode,
+    cfg: AppConfig,
+    db: Database,
+    secrets: EnvSecrets,
+    market_data: MarketDataService,
+    instruments: InstrumentMaster,
+    bus: EventBus,
+    dhan_client: DhanClient | None,
+) -> ModeTree:
+    """Create DB session, OrderManager, lots counter, and engines for one mode."""
+    session_id = await db.start_session(
+        index_name="+".join(i.value for i in cfg.indices),
+        mode=mode.value,
+    )
+    log.info("session_started", session_id=session_id, mode=mode.value)
+
+    if mode == Mode.LIVE:
+        assert dhan_client is not None, "live backend requires Dhan client"
+        backend = LiveBackend(dhan_client)
+        lots = cfg.engine.lots_per_trade_live
+        armed = asyncio.Event()   # live starts disarmed
+    else:
+        backend = PaperBackend(
+            price_lookup=market_data.last_ltp, slippage_bps=cfg.paper.slippage_bps
+        )
+        lots = cfg.engine.lots_per_trade_paper
+        armed = asyncio.Event()
+        armed.set()  # paper is always armed
+
+    async def _order_request_cb(req):
+        await db.record_order_request(session_id, req, None, None)
+
+    async def _order_report_cb(report):
+        await db.record_order_report(report)
+
+    order_mgr = OrderManager(
+        mode=mode, backend=backend, on_request=_order_request_cb, on_report=_order_report_cb
+    )
+
+    tree = ModeTree(mode=mode, order_mgr=order_mgr, session_id=session_id, lots=lots, armed=armed)
+
+    for idx in cfg.indices:
+        engine = StrategyEngine(
+            mode=mode,
+            underlying=idx,
+            cfg=cfg,
+            market_data=market_data,
+            instruments=instruments,
+            order_mgr=order_mgr,
+            db=db,
+            session_id=session_id,
+            kill_switch=tree.kill_switch,
+            armed=armed,
+            event_bus=bus,
+            lots_provider=lambda t=tree: t.lots,
+        )
+        tree.engines[idx] = engine
+
+    return tree
+
 
 async def _run(cfg: AppConfig) -> int:
     secrets = load_secrets()
@@ -231,16 +349,10 @@ async def _run(cfg: AppConfig) -> int:
     loop = asyncio.get_running_loop()
     install_signal_handlers(loop)
 
-    # Persistence.
     db = Database(cfg.persistence.sqlite_path)
     await db.open()
-    session_id = await db.start_session(
-        index_name="+".join(i.value for i in cfg.indices),
-        mode=cfg.mode.value,
-    )
-    log.info("session_started", session_id=session_id, mode=cfg.mode.value)
 
-    # Instrument master.
+    # Instrument master (shared).
     instruments = InstrumentMaster(Path(secrets.VOLSCALP_DATA_DIR) / "instruments")
     try:
         await instruments.ensure_loaded()
@@ -249,16 +361,13 @@ async def _run(cfg: AppConfig) -> int:
         await db.close()
         return 2
 
-    # Tick queue + market data service.
+    # Shared tick queue + market data service.
     tick_queue: asyncio.Queue[Tick] = asyncio.Queue(maxsize=8192)
     market_data = MarketDataService(tick_queue)
-
-    # Register spot security IDs.
-    for idx, (seg, sid) in INDEX_FEED.items():
+    for idx, (_seg, sid) in INDEX_FEED.items():
         market_data.register_spot(sid, idx.value)
 
-    # Dhan market feed (paper mode can still use the live feed — strategy
-    # logic is identical; only order placement differs).
+    # Single Dhan market feed (shared by paper + live).
     feed: DhanMarketFeed | None = None
     if secrets.has_dhan_credentials():
         feed = DhanMarketFeed(
@@ -271,32 +380,14 @@ async def _run(cfg: AppConfig) -> int:
     else:
         log.warning("dhan_credentials_missing — running without live feed (paper w/o data)")
 
-    # Order backend.
+    # Dhan REST client (for live order placement + position reconciliation).
     dhan_client: DhanClient | None = None
-    if cfg.mode == Mode.LIVE:
-        if not secrets.has_dhan_credentials():
-            log.error("cannot_start_live_without_credentials")
-            await db.close()
-            return 3
+    if secrets.has_dhan_credentials():
         dhan_client = DhanClient(
             secrets.DHAN_CLIENT_ID,
             secrets.DHAN_ACCESS_TOKEN,
             timeout_s=cfg.broker.order_timeout_s,
         )
-        backend = LiveBackend(dhan_client)
-    else:
-        backend = PaperBackend(price_lookup=market_data.last_ltp, slippage_bps=cfg.paper.slippage_bps)
-
-    async def _order_request_cb(req):
-        # Best-effort persistence of the order request (cycle/leg IDs set by engine).
-        await db.record_order_request(req, None, None)
-
-    async def _order_report_cb(report):
-        await db.record_order_report(report)
-
-    order_mgr = OrderManager(
-        mode=cfg.mode, backend=backend, on_request=_order_request_cb, on_report=_order_report_cb
-    )
 
     # Event bus + runtime state.
     bus = EventBus()
@@ -304,38 +395,36 @@ async def _run(cfg: AppConfig) -> int:
     state.market_data = market_data
     state.dhan_client = dhan_client
 
-    # Strategy engines (one per index).
-    engines: list[StrategyEngine] = []
-    for idx in cfg.indices:
-        engine = StrategyEngine(
-            underlying=idx,
-            cfg=cfg,
-            market_data=market_data,
-            instruments=instruments,
-            order_mgr=order_mgr,
-            db=db,
-            kill_switch=state.kill_switch,
-            event_bus=bus,
-        )
-        engines.append(engine)
-        state.register_engine(idx, engine)
+    # Always build paper. Build live only if we have Dhan credentials.
+    paper_tree = await _build_mode_tree(
+        Mode.PAPER, cfg, db, secrets, market_data, instruments, bus, dhan_client=None,
+    )
+    state.register_mode(paper_tree)
 
-    # Pre-subscribe option strikes around ATM for each index so ticks are
-    # flowing by the time cycles start.
+    if dhan_client is not None:
+        live_tree = await _build_mode_tree(
+            Mode.LIVE, cfg, db, secrets, market_data, instruments, bus, dhan_client=dhan_client,
+        )
+        state.register_mode(live_tree)
+    else:
+        log.warning("live_mode_disabled_no_credentials")
+
+    # Collect every engine for task spawning + shutdown fan-out.
+    all_engines: list[StrategyEngine] = []
+    for tree in state.modes.values():
+        all_engines.extend(tree.engines.values())
+
+    # Pre-subscribe option strikes around ATM so ticks are flowing by the
+    # time cycles start. Also seed with a broad slice of strikes.
     if feed is not None:
         initial_subs: list[tuple[str, int]] = []
         for idx in cfg.indices:
             inst_cfg = cfg.instruments[idx]
             expiry = instruments.pick_expiry(idx, cfg.expiry)
-            # We don't have spot yet — subscribe to index feed first, then
-            # ATM ± N once spot arrives (via `dynamic_subscribe` below).
             seg, sid = INDEX_FEED[idx]
             initial_subs.append((seg, sid))
-            # Also seed with a broad range of option strikes using any known
-            # strikes for the expiry (reduces first-cycle subscription delay).
             strikes = instruments.strikes_for(idx.value, expiry)
             if strikes:
-                # Pick a central slice (30 strikes) to keep initial sub size small.
                 mid = len(strikes) // 2
                 slice_ = strikes[max(0, mid - 30): mid + 30]
                 for k in slice_:
@@ -370,24 +459,40 @@ async def _run(cfg: AppConfig) -> int:
                             subs.append((opt.exchange_segment, opt.security_id))
                 if subs and feed:
                     await feed.subscribe(subs)
-                    log.info("atm_range_subscribed", underlying=idx.value,
-                             atm=atm, count=len(subs))
+                    log.info("atm_range_subscribed", underlying=idx.value, atm=atm, count=len(subs))
                 seen.add(idx)
             try:
                 await asyncio.wait_for(shutdown_event().wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 continue
 
-    # Reconciler (live only).
+    # Position reconciler — only meaningful for live.
     reconciler_task: asyncio.Task | None = None
-    if cfg.mode == Mode.LIVE and dhan_client is not None:
+    if dhan_client is not None:
         state.reconciler = PositionReconciler(dhan_client, interval_s=cfg.broker.reconcile_interval_s)
         reconciler_task = asyncio.create_task(state.reconciler.run(), name="reconciler")
 
+    async def cumulative_pnl_refresher() -> None:
+        """Keep state.cumulative_pnl_by_mode in sync with SQLite every 5 s."""
+        while not shutdown_event().is_set():
+            for mode in state.modes:
+                try:
+                    state.cumulative_pnl_by_mode[mode] = await db.fetch_mode_cumulative_pnl(mode.value)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("cumulative_pnl_refresh_error", mode=mode.value, error=str(exc))
+            try:
+                await asyncio.wait_for(shutdown_event().wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+
     # Engines.
-    engine_tasks = [asyncio.create_task(e.run(), name=f"engine-{e.underlying.value}") for e in engines]
+    engine_tasks = [
+        asyncio.create_task(e.run(), name=f"engine-{e.mode.value}-{e.underlying.value}")
+        for e in all_engines
+    ]
     md_task = asyncio.create_task(market_data.run(), name="market_data")
     sub_task = asyncio.create_task(dynamic_subscriber(), name="dynamic_subscriber")
+    cum_task = asyncio.create_task(cumulative_pnl_refresher(), name="cumulative_pnl_refresher")
 
     # Dashboard server.
     app = create_app(state)
@@ -398,10 +503,9 @@ async def _run(cfg: AppConfig) -> int:
     server = uvicorn.Server(server_cfg)
     server_task = asyncio.create_task(server.serve(), name="uvicorn")
 
-    # Shutdown callbacks (LIFO).
     async def _shutdown() -> None:
         log.info("shutdown_sequence_starting")
-        for e in engines:
+        for e in all_engines:
             e.stop()
         market_data.stop()
         if feed:
@@ -409,15 +513,20 @@ async def _run(cfg: AppConfig) -> int:
         if state.reconciler:
             state.reconciler.stop()
         server.should_exit = True
-        try:
-            await db.end_session(
-                realized_pnl=sum(e.realized_pnl for e in engines),
-                total_cycles=sum(e.closed_cycles_count for e in engines),
-                peak=max((e.peak_session_pnl for e in engines), default=0.0),
-                trough=min((e.trough_session_pnl for e in engines), default=0.0),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("end_session_error", error=str(exc))
+
+        # End one session row per mode with its rolled-up P&L.
+        for tree in state.modes.values():
+            engines = list(tree.engines.values())
+            try:
+                await db.end_session(
+                    session_id=tree.session_id,
+                    realized_pnl=sum(e.realized_pnl for e in engines),
+                    total_cycles=sum(e.closed_cycles_count for e in engines),
+                    peak=max((e.peak_session_pnl for e in engines), default=0.0),
+                    trough=min((e.trough_session_pnl for e in engines), default=0.0),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("end_session_error", mode=tree.mode.value, error=str(exc))
         await db.close()
         if dhan_client:
             await dhan_client.close()
@@ -426,12 +535,12 @@ async def _run(cfg: AppConfig) -> int:
 
     log.info(
         "volscalp_ready",
-        mode=cfg.mode.value,
+        modes=[m.value for m in state.modes],
+        live_available=state.has_live(),
         dashboard=f"http://{cfg.dashboard.host}:{cfg.dashboard.port}",
         indices=[i.value for i in cfg.indices],
     )
 
-    # Wait for shutdown signal.
     try:
         await shutdown_event().wait()
     except asyncio.CancelledError:
@@ -440,9 +549,8 @@ async def _run(cfg: AppConfig) -> int:
     log.info("shutdown_requested_running_callbacks")
     await run_shutdown_callbacks()
 
-    # Cancel remaining tasks.
     all_tasks = [t for t in (
-        md_task, sub_task, server_task, feed_task, reconciler_task, *engine_tasks,
+        md_task, sub_task, cum_task, server_task, feed_task, reconciler_task, *engine_tasks,
     ) if t is not None]
     for t in all_tasks:
         t.cancel()
@@ -456,14 +564,11 @@ def cli() -> None:
     """Console-script entrypoint (installed as `volscalp`)."""
     parser = argparse.ArgumentParser(prog="volscalp", description="Repeated OTM Strangle trading app")
     parser.add_argument("--config", "-c", default="configs/default.yaml")
-    parser.add_argument("--mode", choices=["paper", "live"], help="override configured mode")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    if args.mode:
-        cfg = cfg.model_copy(update={"mode": Mode(args.mode)})
 
-    # uvloop for lower overhead when available.
+    # uvloop for lower overhead when available (Linux/macOS only).
     try:
         import uvloop  # type: ignore[import-not-found]
         uvloop.install()

@@ -28,6 +28,35 @@ header button.danger { background: #3a1a22; border-color: #5a242f; color: var(--
 header button.danger:hover { background: #53202c; }
 
 .pill { padding: 4px 10px; border-radius: 999px; background: #1f2533; color: var(--muted); font-size: 11px; }
+.pill.ok   { background: #1f3323; color: var(--green); }
+.pill.warn { background: #3a2f12; color: var(--amber); }
+.pill.danger { background: #3a1a22; color: var(--red); }
+
+.hidden { display: none !important; }
+
+.tabs { display: flex; gap: 0; padding: 10px 18px 0 18px; border-bottom: 1px solid var(--border); background: #12151c; }
+.tab { background: transparent; color: var(--muted); border: 1px solid transparent; border-bottom: none;
+       padding: 8px 16px; font: inherit; cursor: pointer; display: flex; align-items: center; gap: 8px;
+       border-top-left-radius: 6px; border-top-right-radius: 6px; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--text); background: var(--card); border-color: var(--border); }
+
+.pane { padding: 0; }
+.pane-controls { display: flex; align-items: center; gap: 10px; padding: 14px 18px; flex-wrap: wrap; }
+.pane-controls label, .pane-controls input, .pane-controls button, .pane-controls select {
+  font: inherit; padding: 6px 10px; background: #1b2030; color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+}
+.pane-controls button { cursor: pointer; }
+.pane-controls button:hover:not(:disabled) { background: #222838; }
+.pane-controls button:disabled { opacity: 0.45; cursor: not-allowed; }
+.pane-controls button.primary { background: #1f3323; border-color: #2d4d35; color: var(--green); }
+.pane-controls button.primary:hover:not(:disabled) { background: #2a4530; }
+.pane-controls button.danger  { background: #3a1a22; border-color: #5a242f; color: var(--red); }
+.pane-controls button.danger:hover:not(:disabled) { background: #53202c; }
+.pane-controls button.ghost { background: transparent; color: var(--muted); }
+
+.warning { margin: 14px 18px; padding: 12px 14px; background: #3a2f12; border: 1px solid #6b552b; border-radius: 6px; color: var(--amber); }
+.warning code { background: #22282e; padding: 1px 5px; border-radius: 3px; color: var(--text); }
 
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; padding: 14px 18px; }
 .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
@@ -56,9 +85,9 @@ header button.danger:hover { background: #53202c; }
 .cycle-panel .status-STOPPED { color: var(--red); }
 .cycle-panel .status-EXITING { color: var(--amber); }
 
-table#trades { width: 100%; border-collapse: collapse; }
-table#trades th, table#trades td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: right; font-size: 12px; }
-table#trades th:first-child, table#trades td:first-child,
-table#trades th:nth-child(2), table#trades td:nth-child(2) { text-align: left; }
+table[id^="trades"] { width: 100%; border-collapse: collapse; }
+table[id^="trades"] th, table[id^="trades"] td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: right; font-size: 12px; }
+table[id^="trades"] th:first-child, table[id^="trades"] td:first-child,
+table[id^="trades"] th:nth-child(2), table[id^="trades"] td:nth-child(2) { text-align: left; }
 
 footer { text-align: center; color: var(--muted); padding: 18px; }

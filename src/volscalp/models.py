@@ -43,7 +43,7 @@ class ExitReason(str, Enum):
     LEG_SL = "LEG_SL"
     MTM_TARGET = "MTM_TARGET"
     MTM_MAX_LOSS = "MTM_MAX_LOSS"
-    LOCK_TRAIL_FLOOR = "LOCK_TRAIL_FLOOR"
+    LOCK_TRAIL = "LOCK_TRAIL"
     SESSION_CLOSE = "SESSION_CLOSE"
     KILL_SWITCH = "KILL_SWITCH"
     MANUAL = "MANUAL"
@@ -208,9 +208,6 @@ class Cycle:
     mtm: float = 0.0
     peak_mtm: float = 0.0
     trough_mtm: float = 0.0
-
-    lock_activated: bool = False
-    lock_floor: float = 0.0
 
     lazy_ce_scheduled: bool = False
     lazy_pe_scheduled: bool = False

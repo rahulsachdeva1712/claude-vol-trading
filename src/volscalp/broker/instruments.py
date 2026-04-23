@@ -25,19 +25,40 @@ DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv
 CACHE_TTL_HOURS = 20   # re-download after 20h so we always have today's master
 
 # Column names can change across Dhan revisions; we remap defensively.
+# Both the current (post-2026-04) plain-named schema and the legacy SEM_*
+# schema are covered. The loader ignores any alias whose source column
+# isn't present in the CSV, so listing both is safe.
 _COLUMN_ALIASES = {
+    # --- current detailed-master schema ---
+    "SECURITY_ID":       "security_id",
+    "EXCH_ID":           "exchange",
+    "SEGMENT":           "segment",
+    "INSTRUMENT":        "instrument",
+    "SM_EXPIRY_DATE":    "expiry",
+    "STRIKE_PRICE":      "strike",
+    "OPTION_TYPE":       "option_type",
+    "LOT_SIZE":          "lot_size",
+    "DISPLAY_NAME":      "symbol",
+    "SYMBOL_NAME":       "custom_symbol",
+    "UNDERLYING_SYMBOL": "underlying_name",
+    # --- legacy SEM_* schema (older compact master) ---
     "SEM_SMST_SECURITY_ID": "security_id",
-    "SEM_EXM_EXCH_ID": "exchange",
-    "SEM_SEGMENT": "segment",
-    "SEM_INSTRUMENT_NAME": "instrument",
-    "SEM_EXPIRY_DATE": "expiry",
-    "SEM_STRIKE_PRICE": "strike",
-    "SEM_OPTION_TYPE": "option_type",
-    "SEM_LOT_UNITS": "lot_size",
-    "SEM_TRADING_SYMBOL": "symbol",
-    "SEM_CUSTOM_SYMBOL": "custom_symbol",
-    "SM_SYMBOL_NAME": "underlying_name",
+    "SEM_EXM_EXCH_ID":      "exchange",
+    "SEM_SEGMENT":          "segment",
+    "SEM_INSTRUMENT_NAME":  "instrument",
+    "SEM_EXPIRY_DATE":      "expiry",
+    "SEM_STRIKE_PRICE":     "strike",
+    "SEM_OPTION_TYPE":      "option_type",
+    "SEM_LOT_UNITS":        "lot_size",
+    "SEM_TRADING_SYMBOL":   "symbol",
+    "SEM_CUSTOM_SYMBOL":    "custom_symbol",
+    "SM_SYMBOL_NAME":       "underlying_name",
 }
+
+# Dhan API exchange_segment codes expected by the WS feed / order API.
+# The detailed-master SEGMENT column uses single-letter codes; map to the
+# combined string Dhan's APIs need.
+_SEGMENT_CODE = {"D": "FNO", "E": "EQ", "I": "I", "C": "CURRENCY", "M": "COMM"}
 
 
 class InstrumentMaster:
@@ -76,17 +97,25 @@ class InstrumentMaster:
 
         # Filter option rows for NIFTY / BANKNIFTY.
         if "instrument" not in df.columns:
-            raise RuntimeError("Dhan master missing 'instrument' column; schema changed.")
-        options = df[df["instrument"].isin(["OPTIDX", "OPTION"])].copy()
+            raise RuntimeError(
+                f"Dhan master missing 'instrument' column; got {list(df.columns)}"
+            )
+        options = df[
+            df["instrument"].astype(str).str.upper().str.strip().isin(["OPTIDX", "OPTION", "OPT"])
+        ].copy()
 
-        # Derive underlying name from trading symbol prefix as a fallback.
+        # Derive underlying name — prefer the explicit UNDERLYING_SYMBOL,
+        # fall back to parsing the display-name prefix.
         def _underlying(row) -> str:
+            u = str(row.get("underlying_name", "")).upper().strip()
+            if u in ("NIFTY", "BANKNIFTY"):
+                return u
             sym = str(row.get("symbol", "")).upper()
             if sym.startswith("BANKNIFTY"):
                 return "BANKNIFTY"
             if sym.startswith("NIFTY"):
                 return "NIFTY"
-            return str(row.get("underlying_name", "")).upper()
+            return u
 
         options["underlying"] = options.apply(_underlying, axis=1)
         options = options[options["underlying"].isin(["NIFTY", "BANKNIFTY"])]
@@ -97,7 +126,20 @@ class InstrumentMaster:
         options["lot_size"] = pd.to_numeric(options.get("lot_size", 0), errors="coerce").fillna(0).astype(int)
         options["option_type"] = options["option_type"].astype(str).str.upper().str.strip()
         options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date.astype(str)
-        options["segment"] = options.get("segment", "NSE_FNO").astype(str).str.upper()
+
+        # Exchange-segment string expected by Dhan's WS + order APIs.
+        # The detailed master uses single-letter SEGMENT codes (D/E/I/C/M);
+        # combine with EXCH_ID → "NSE_FNO" etc. Index segment is the
+        # fixed "IDX_I" regardless of exchange.
+        def _segment(row) -> str:
+            exch = str(row.get("exchange", "NSE")).upper().strip() or "NSE"
+            raw = str(row.get("segment", "D")).upper().strip() or "D"
+            seg = _SEGMENT_CODE.get(raw, raw)
+            if seg == "I":
+                return "IDX_I"
+            return f"{exch}_{seg}"
+
+        options["segment"] = options.apply(_segment, axis=1)
 
         self._df = options
         self._by_id.clear()
