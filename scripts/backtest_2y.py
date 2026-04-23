@@ -621,7 +621,49 @@ def simulate_session(
                             else:
                                 lazy_ce_done = True
 
-            # 2) Cycle MTM (realized + unrealized).
+            # 2a) Intrabar TARGET check — mark each ACTIVE leg at its
+            # bar.high and see if aggregate MTM would have crossed target
+            # at any tick inside this minute. Exit fills at bar.high for
+            # each ACTIVE leg. Mirrors the live engine's
+            # _evaluate_mtm_intrabar_target (strategy/engine.py), which
+            # fires MTM_TARGET off leg.last_price on every WS tick.
+            # MAX_LOSS intentionally stays on bar-close (step 2b) so a
+            # transient intrabar dip doesn't force-close a cycle that
+            # recovers. See FRD §5.2 / §5.4. Backtest 2026-04 showed
+            # +55% cycle count and +55% P&L with unchanged MAX_LOSS.
+            any_active = any(leg.status == "ACTIVE" for leg in legs)
+            if any_active:
+                intrabar_realized = sum(l.realized_pnl for l in legs)
+                intrabar_unrealized = 0.0
+                active_high_prices: dict[int, float] = {}
+                for leg in legs:
+                    if leg.status != "ACTIVE":
+                        continue
+                    bar = leg.active_bar(m_now)
+                    if bar is None or bar.high <= 0:
+                        continue
+                    active_high_prices[leg.slot] = bar.high
+                    intrabar_unrealized += (bar.high - leg.entry_price) * leg.quantity
+                target = spec.get("target")
+                intrabar_mtm = intrabar_realized + intrabar_unrealized
+                if intrabar_mtm > peak_mtm:
+                    peak_mtm = intrabar_mtm
+                if target is not None and intrabar_mtm >= target:
+                    for leg in legs:
+                        if leg.status != "ACTIVE":
+                            continue
+                        fill = active_high_prices.get(leg.slot)
+                        leg.exit_price = round(
+                            fill if fill and fill > 0 else (leg.last_price or leg.entry_price),
+                            2,
+                        )
+                        leg.status = "STOPPED"
+                        leg.exit_reason = "MTM_TARGET"
+                        leg.exit_epoch = m_now
+                    cycle_exit_reason = "MTM_TARGET"
+                    break
+
+            # 2b) Bar-close MTM — for MAX_LOSS gating and trough tracking.
             mtm = sum(l.realized_pnl for l in legs) + sum(l.unrealized_pnl for l in legs)
             if mtm > peak_mtm:
                 peak_mtm = mtm
@@ -634,24 +676,18 @@ def simulate_session(
                 cycle_exit_reason = "SESSION_CLOSE"
                 break
 
-            # 4) Aggregate-MTM (cycle-portfolio) exits fire while at least
-            #    one leg is ACTIVE. Mirrors Codex spread_lab.py:1251 — if
-            #    all open positions have closed and we're just waiting on
-            #    a WATCHING lazy/base to enter, the portfolio P&L is
-            #    purely realized and the cycle stays "alive" until either
-            #    a new leg enters or the cycle-done check below breaks.
+            # 4) Aggregate-MTM (cycle-portfolio) MAX_LOSS exit fires while
+            #    at least one leg is ACTIVE. Target was moved to the
+            #    intrabar path above (2a); MAX_LOSS stays on bar-close.
+            #    Mirrors Codex spread_lab.py:1251 — if all open positions
+            #    have closed and we're just waiting on a WATCHING lazy/
+            #    base to enter, the portfolio P&L is purely realized and
+            #    the cycle stays "alive" until either a new leg enters or
+            #    the cycle-done check below breaks.
             any_active = any(leg.status == "ACTIVE" for leg in legs)
             if any_active:
-                # 5) Exit checks — priority order:
-                #    SESSION_CLOSE (handled above) > MTM_MAX_LOSS >
-                #    MTM_TARGET. Lock-and-trail was removed (2026-04) after
-                #    it failed to improve 2y P&L vs plain max_loss/target.
                 if mtm <= -abs(spec["max_loss"]):
                     cycle_exit_reason = "MTM_MAX_LOSS"
-                    break
-                target = spec.get("target")
-                if target is not None and mtm >= target:
-                    cycle_exit_reason = "MTM_TARGET"
                     break
 
             # 7) Cycle-done check — a cycle is "done" when there are no
