@@ -403,43 +403,16 @@ async def simulate_day(
                                     legs.append(new)
                                     leg_bars[4] = ls_bars
 
-            # 2a) Intrabar MAX_LOSS check — worst-case intrabar uses each
-            # ACTIVE leg's bar.low. Priority over TARGET per FRD §5.4.
-            # Exit fills at bar.low for each ACTIVE leg. This mirrors the
-            # live engine (strategy/engine.py::_evaluate_mtm_intrabar),
-            # which fires either threshold off leg.last_price on every
-            # WS tick.
+            # 2a) Intrabar TARGET check — mark each ACTIVE leg at its
+            # bar.high and see if aggregate MTM would have crossed target
+            # at any tick inside this minute. Exit at bar.high for each
+            # ACTIVE leg. This matches the live engine, which fires
+            # MTM_TARGET off leg.last_price on every WS tick (see
+            # strategy/engine.py::_evaluate_mtm_intrabar_target).
+            # MAX_LOSS stays on bar-close in step (2b) so a transient
+            # intrabar dip doesn't force-close a cycle that recovers.
             intrabar_realized = sum(l.realized_pnl for l in legs)
-            low_unrealized = 0.0
-            active_low_prices: dict[int, float] = {}
-            for leg in legs:
-                if leg.status != "ACTIVE":
-                    continue
-                lb = leg_bars.get(leg.slot)
-                if lb is None:
-                    continue
-                bar = minute_bar_at(lb, m_now)
-                if bar is None or bar.low <= 0:
-                    continue
-                active_low_prices[leg.slot] = bar.low
-                low_unrealized += (bar.low - leg.entry_price) * leg.quantity
-            intrabar_low_mtm = intrabar_realized + low_unrealized
-            if intrabar_low_mtm < trough_mtm:
-                trough_mtm = intrabar_low_mtm
-            if intrabar_low_mtm <= -abs(spec["max_loss"]):
-                for leg in legs:
-                    if leg.status != "ACTIVE":
-                        continue
-                    fill = active_low_prices.get(leg.slot)
-                    leg.exit_price = fill if fill and fill > 0 else (leg.last_price or leg.entry_price)
-                    leg.status = "STOPPED"
-                    leg.exit_reason = "MTM_MAX_LOSS"
-                cycle_exit_reason = "MTM_MAX_LOSS"
-                break
-
-            # 2b) Intrabar TARGET check — best-case intrabar uses each
-            # ACTIVE leg's bar.high. Exit fills at bar.high.
-            high_unrealized = 0.0
+            intrabar_unrealized = 0.0
             active_high_prices: dict[int, float] = {}
             for leg in legs:
                 if leg.status != "ACTIVE":
@@ -451,11 +424,11 @@ async def simulate_day(
                 if bar is None or bar.high <= 0:
                     continue
                 active_high_prices[leg.slot] = bar.high
-                high_unrealized += (bar.high - leg.entry_price) * leg.quantity
-            intrabar_high_mtm = intrabar_realized + high_unrealized
-            if intrabar_high_mtm > peak_mtm:
-                peak_mtm = intrabar_high_mtm
-            if intrabar_high_mtm >= spec["target"]:
+                intrabar_unrealized += (bar.high - leg.entry_price) * leg.quantity
+            intrabar_mtm = intrabar_realized + intrabar_unrealized
+            if intrabar_mtm > peak_mtm:
+                peak_mtm = intrabar_mtm
+            if intrabar_mtm >= spec["target"]:
                 for leg in legs:
                     if leg.status != "ACTIVE":
                         continue
@@ -466,14 +439,20 @@ async def simulate_day(
                 cycle_exit_reason = "MTM_TARGET"
                 break
 
-            # 2c) Bar-close MTM — for peak/trough with close-price sample.
+            # 2b) Bar-close MTM — for MAX_LOSS gating and trough tracking.
             mtm = sum(l.realized_pnl for l in legs) + sum(l.unrealized_pnl for l in legs)
             if mtm > peak_mtm:
                 peak_mtm = mtm
             if mtm < trough_mtm:
                 trough_mtm = mtm
 
-            # 3) Session close
+            # 3) Exit checks — priority: session_close, max_loss.
+            # (target already handled intrabar above; session-close on loop exit.)
+            if mtm <= -abs(spec["max_loss"]):
+                cycle_exit_reason = "MTM_MAX_LOSS"
+                break
+
+            # 4) Session close
             mt_ist = datetime.fromtimestamp(m_now, tz=IST).time()
             if mt_ist >= SESSION_END:
                 cycle_exit_reason = "SESSION_CLOSE"

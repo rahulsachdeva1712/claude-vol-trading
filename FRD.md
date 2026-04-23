@@ -69,8 +69,8 @@ risk controls.
 | 1    | 09:15–09:29 | App initialises, loads config, establishes data feed, computes initial ATM. |
 | 2    | 09:30       | Cycle 1 starts. Begin watching ATM+6 CE and ATM-6 PE for momentum entry. |
 | 3    | Per bar     | Check entry condition for each unentered base leg. Enter on first qualifying bar. |
-| 4    | Per bar     | For entered legs: check leg SL on the bar's low. |
-| 4b   | Per tick    | Check cycle-level MTM `max_loss` (priority) and `target` intrabar (1 Hz) against current LTP. See §5.2. |
+| 4    | Per bar     | For entered legs: check leg SL. Check cycle-level MTM `max_loss` (bar-close). |
+| 4b   | Per tick    | Check cycle-level MTM `target` intrabar (1 Hz) against current LTP. See §5.2. |
 | 5    | Base leg SL | Immediately enter opposite-side lazy leg (no momentum gate) if not yet opened in this cycle. |
 | 6    | Cycle exit  | Close all open legs. Record cycle P&L.                                 |
 | 7    | Next bar    | Start next cycle immediately (cooldown = 0 minutes).                   |
@@ -197,29 +197,20 @@ of **all legs in the current cycle** (realised P&L of stopped legs +
 unrealised P&L of open legs). A single aggregate breach closes the
 whole cycle at once.
 
-Both thresholds are evaluated **intrabar**, on every engine tick (1 Hz),
-with `max_loss` checked first (FRD §5.4 priority). A single aggregate
-breach closes the whole cycle at once.
+The cycle has two thresholds evaluated on different cadences:
 
-- **`max_loss`** (hard stop) — evaluated **intrabar** on every engine
-  tick. The live/paper engine uses each leg's current LTP (refreshed by
-  the WS feed on every tick); the backtest approximates simultaneous
-  intrabar prices with each ACTIVE leg's bar **low** (worst-case). As
-  soon as aggregate MTM crosses `-max_loss`, all ACTIVE legs exit at the
-  trigger-moment price. The bar-close pass remains as a safety-net
-  backstop for the cases where the 1 Hz tick loop was starved.
-- **`target`** (take-profit) — evaluated **intrabar** on every engine
-  tick. The live/paper engine uses each leg's current LTP (refreshed by
-  the WS feed on every tick); the backtest approximates simultaneous
-  intrabar prices with each ACTIVE leg's bar **high** (best-case). As
+- **`max_loss`** (hard stop) — evaluated on **bar close** only. The
+  end-of-bar evaluation absorbs transient intrabar dips, so a spike
+  that would have force-closed at the bottom of a minute but
+  recovered by the bar close does not blow up the cycle.
+- **`target`** (take-profit) — evaluated **intrabar**, on every engine
+  tick (1 Hz). The live/paper engine uses each leg's current LTP
+  (refreshed by the WS feed on every tick); the backtest approximates
+  simultaneous intrabar prices with each ACTIVE leg's bar high. As
   soon as aggregate MTM crosses `target`, all ACTIVE legs exit at the
   trigger-moment price. Backtest April 2026 (15 sessions) showed +55 %
   cycle count and +55 % P&L versus the same target evaluated on bar
-  close.
-
-MAX_LOSS was moved to intrabar (2026-04) for symmetry with TARGET — on
-every tick both thresholds are checked in priority order (MAX_LOSS
-first).
+  close, with MAX_LOSS cadence unchanged.
 
 **NIFTY**
 
@@ -267,14 +258,16 @@ models, the paper/live engine, and both backtest scripts.
 When multiple exit conditions could apply simultaneously, priority is:
 1. Kill switch (live only — disarms + flattens all live cycles)
 2. Session close at 15:15 (always overrides 3-5)
-3. Overall MTM max loss breached (`MTM_MAX_LOSS`) — evaluated intrabar (1 Hz tick)
+3. Overall MTM max loss breached (`MTM_MAX_LOSS`) — evaluated on bar close
 4. Overall MTM target reached (`MTM_TARGET`) — evaluated intrabar (1 Hz tick)
 5. Individual leg SL hit (`LEG_SL` — exits only that leg, cycle continues)
 
-Both aggregate-MTM thresholds are evaluated on the same 1 Hz tick; on
-each tick MAX_LOSS is checked before TARGET, so a simultaneous breach
-of both resolves to `MTM_MAX_LOSS`. Bar-close is a safety-net backstop
-for both — the primary evaluation is intrabar (see §5.2).
+Priority here is evaluation-cadence-aware: an intrabar target hit at
+09:40:37 fires immediately, even though MAX_LOSS for the same minute
+wouldn't have been evaluated until the 09:41 bar close. This is
+intentional — capturing take-profits the moment they're available is
+strictly additive, whereas MAX_LOSS is a hard stop whose job is to
+tolerate normal intra-minute volatility (see §5.2).
 
 ---
 
@@ -423,7 +416,7 @@ intended — paper is an idealised twin, not a strict mirror.
 ### 9.2 MTM Profile Parameters
 | Parameter        | NIFTY    | BANKNIFTY | Description                                                |
 |------------------|----------|-----------|------------------------------------------------------------|
-| max_loss         | Rs.2500  | Rs.2500   | Max cycle loss — force-close intrabar (1 Hz tick) when cycle MTM <= -max_loss |
+| max_loss         | Rs.2500  | Rs.2500   | Max cycle loss — force-close at bar close when cycle MTM <= -max_loss |
 | target           | Rs.300   | Rs.300    | Cycle profit target — force-close intrabar (1 Hz tick) when cycle MTM >= target |
 
 Lock-and-trail fields (`lock_start`, `lock_profit`, `trail_step`,
