@@ -8,8 +8,13 @@ session id — is per-engine.
 
 Hot path:
     tick → update leg last_price → recompute cycle MTM → MtmController
-    bar close → entry evaluation (momentum) → place orders
-    leg SL hit (per-bar) → exit that leg → maybe schedule lazy leg
+    bar close → entry evaluation (momentum) for BASE legs → place orders
+    leg SL hit (per-bar) → exit that leg → immediately enter opposite lazy
+        leg (no momentum gate — Codex aggregate-MTM semantics)
+    cycle aggregate MTM (realized + unrealized) crosses target/max_loss
+        → force-close remaining ACTIVE legs
+    last surviving leg exits and no lazy is pending → cycle is "done"
+        → next cycle spins up on the next bar
     session close → force-close everything
 
 Every decision is timestamped and (best-effort) logged to the DB via the
@@ -103,15 +108,59 @@ class StrategyEngine:
     def stop(self) -> None:
         self._stop.set()
 
+    async def _backfill_counters_from_db(self) -> None:
+        """Rehydrate in-memory KPI counters from today's closed cycles.
+
+        A new DB session row is created on every process start, so without
+        this the KPI strip would show zeros after any mid-day restart even
+        though today's cycles are safely on disk. The reconstruction is
+        across all sessions for this (mode, underlying) on today's date,
+        so multiple restarts in a single trading day still roll up into
+        one view.
+
+        Peak/trough here are the running max/min of cumulative realized
+        P&L across cycle-close boundaries; we can't recover intra-cycle
+        MTM from the DB, but cycle-close boundaries are a faithful
+        reconstruction of what the engine held at the moment of its last
+        close, and the live tick loop will immediately start updating
+        peak/trough again against unrealized MTM once a new cycle opens.
+        """
+        today_iso = datetime.now(self.tz).date().isoformat()
+        try:
+            kpis = await self.db.fetch_today_engine_kpis(
+                self.mode.value, self.underlying.value, today_iso,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("kpi_backfill_failed", tag=self.tag, error=str(exc))
+            return
+
+        if not kpis or kpis.get("closed_cycles", 0) == 0:
+            return
+
+        self.realized_pnl = float(kpis["realized_pnl"])
+        self.closed_cycles_count = int(kpis["closed_cycles"])
+        self.win_count = int(kpis["wins"])
+        self.loss_count = int(kpis["losses"])
+        self.peak_session_pnl = float(kpis["peak_session_pnl"])
+        self.trough_session_pnl = float(kpis["trough_session_pnl"])
+        # New cycles opened in this process should continue numbering from
+        # today's max — the UI labels cycles 1..N per trading day, not per
+        # process boot.
+        self.cycle_counter = int(kpis["max_cycle_no"])
+
     async def run(self) -> None:
         """Engine driver — pumps the cycle state machine on a 1-second tick."""
         self.expiry = self.instruments.pick_expiry(self.underlying, self.cfg.expiry)
+        await self._backfill_counters_from_db()
         log.info(
             "engine_started",
             tag=self.tag,
             underlying=self.underlying.value,
             mode=self.mode.value,
             expiry=self.expiry,
+            backfilled_realized_pnl=round(self.realized_pnl, 2),
+            backfilled_cycles=self.closed_cycles_count,
+            backfilled_cycle_counter=self.cycle_counter,
         )
 
         while not self._stop.is_set():
@@ -158,11 +207,66 @@ class StrategyEngine:
             await self._start_new_cycle()
             return
 
+        # Intrabar target-only MTM check. Runs every engine tick (1Hz) off
+        # leg.last_price — which _on_tick keeps fresh from the WS feed — so
+        # take-profit fires the moment aggregate MTM crosses the threshold
+        # instead of waiting for bar close. MAX_LOSS intentionally stays on
+        # bar close (via _evaluate_mtm in _on_bar_close) so a transient
+        # mid-bar dip doesn't force-close a cycle that would have recovered.
+        # Backtest 2026-04 showed +55% cycle count and +55% P&L with
+        # unchanged MAX_LOSS cadence. See FRD §5.2 / §5.4.
+        await self._evaluate_mtm_intrabar_target()
+
+        # Cycle-done detector (aggregate-MTM semantics — FRD §5.2 / §6.1):
+        # If every leg in the current cycle has already stopped (or was
+        # never filled) and nothing is still WATCHING for a momentum
+        # entry, the cycle is done — close it and let the next tick spin
+        # up a new one (cooldown=0). Without this, a cycle where both
+        # bases SL out and no lazy is eligible would idle all the way to
+        # session close, blocking further cycles for the day. This
+        # matches the behaviour of scripts/backtest_2y.py's cycle-done
+        # break (see §5-7 of simulate_session).
+        if (
+            self.current_cycle.state != CycleState.CLOSED
+            and self._cycle_is_done(self.current_cycle)
+        ):
+            reason = self._last_leg_exit_reason(self.current_cycle) or ExitReason.LEG_SL
+            await self._force_close_all(reason)
+
         # If the current cycle is fully closed, open the next (cooldown = 0).
         if self.current_cycle.state == CycleState.CLOSED:
             self.current_cycle = None
             if not after_close and self.armed.is_set():
                 await self._start_new_cycle()
+
+    @staticmethod
+    def _cycle_is_done(cycle) -> bool:
+        """True when no leg is still alive — i.e. everyone is STOPPED or
+        EMPTY, with at least one leg actually in a terminal state (so a
+        cycle that just started with only EMPTY slots from a missing
+        strike chain also returns True and gets re-opened quickly)."""
+        has_alive = any(
+            leg.status in (LegStatus.WATCHING, LegStatus.PENDING,
+                           LegStatus.ACTIVE, LegStatus.EXITING)
+            for leg in cycle.legs.values()
+        )
+        if has_alive:
+            return False
+        has_any_leg = bool(cycle.legs)
+        return has_any_leg
+
+    @staticmethod
+    def _last_leg_exit_reason(cycle) -> ExitReason | None:
+        """Return the exit reason of the most recently stopped leg.
+        Used to label a cycle that ran out of alive legs with the same
+        reason the last leg reported (e.g. LEG_SL if the final leg SL'd
+        out). Mirrors Codex spread_lab.py:1360."""
+        stopped = [leg for leg in cycle.legs.values()
+                   if leg.status == LegStatus.STOPPED and leg.exit_bar_ts]
+        if not stopped:
+            return None
+        stopped.sort(key=lambda leg: leg.exit_bar_ts, reverse=True)
+        return stopped[0].exit_reason
 
     async def _start_new_cycle(self) -> None:
         spot = self.md.spot(self.underlying.value)
@@ -300,14 +404,16 @@ class StrategyEngine:
                     "SKIP",
                 )
 
-        # SL check for ACTIVE legs (close-based per FRD default).
+        # SL check for ACTIVE legs. Default ref price is bar.low (intrabar
+        # trigger; matches Codex's simulate_strategy_day + backtest_2y). Set
+        # engine.sl_price_source=close in YAML for end-of-bar simulation.
         for leg in list(cycle.legs.values()):
             if leg.security_id != bar.security_id or leg.status != LegStatus.ACTIVE:
                 continue
             ref_price = bar.close if self.cfg.engine.sl_price_source == "close" else bar.low
             if ref_price <= leg.sl_price:
                 await self._exit_leg(leg, ref_price, ExitReason.LEG_SL)
-                await self._maybe_schedule_lazy_leg(leg)
+                await self._maybe_schedule_lazy_leg(leg, bar)
 
         # Cycle-level MTM re-evaluation.
         await self._evaluate_mtm()
@@ -416,7 +522,14 @@ class StrategyEngine:
              "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
         )
 
-    async def _maybe_schedule_lazy_leg(self, stopped: Leg) -> None:
+    async def _maybe_schedule_lazy_leg(self, stopped: Leg, bar: Bar) -> None:
+        """Enter the lazy (opposite-side OTM) leg at the stop-minute bar close.
+
+        Codex semantics: lazy leg goes ACTIVE immediately when the base leg
+        stops — there is no subsequent momentum-gate wait. The entry price is
+        the current (stop-minute) close of the lazy instrument; if we have no
+        fresh bar for it yet we fall back to the last known LTP.
+        """
         cycle = self.current_cycle
         if not cycle or not self.cfg.engine.lazy_enabled or stopped.kind != LegKind.BASE:
             return
@@ -446,15 +559,37 @@ class StrategyEngine:
 
         leg = self._new_leg_slot(slot, LegKind.LAZY, opposite, strike)
         inst = self.instruments.get(self.underlying.value, self.expiry, strike, opposite)
-        if inst:
-            leg.security_id = inst.security_id
-            leg.trading_symbol = inst.trading_symbol
-            if not leg.lot_size:
-                leg.lot_size = inst.lot_size
-        else:
+        if not inst:
             log.warning("lazy_leg_strike_missing", strike=strike, option_type=opposite.value)
             leg.status = LegStatus.EMPTY
+            cycle.legs[slot] = leg
+            return
+
+        leg.security_id = inst.security_id
+        leg.trading_symbol = inst.trading_symbol
+        if not leg.lot_size:
+            leg.lot_size = inst.lot_size
         cycle.legs[slot] = leg
+
+        # Build a bar for the lazy instrument at the same stop-minute. Prefer
+        # the live candle builder's in-progress bar; fall back to last LTP
+        # wrapped in a minimal OHLC shell so _enter_leg has a close to use.
+        lazy_bar = self.md.current_bar(leg.security_id)
+        if lazy_bar is None or lazy_bar.close <= 0:
+            px = self.md.last_ltp(leg.security_id)
+            if px <= 0:
+                log.warning(
+                    "lazy_leg_no_price",
+                    slot=slot, strike=strike, option_type=opposite.value,
+                )
+                leg.status = LegStatus.EMPTY
+                return
+            lazy_bar = Bar(
+                security_id=leg.security_id,
+                minute_epoch=bar.minute_epoch,
+                open=px, high=px, low=px, close=px,
+            )
+
         log.info(
             "lazy_leg_scheduled",
             tag=self.tag,
@@ -463,7 +598,10 @@ class StrategyEngine:
             slot=slot,
             strike=strike,
             option_type=opposite.value,
+            entry_price=lazy_bar.close,
         )
+
+        await self._enter_leg(leg, lazy_bar)
 
     # ---- MTM ---------------------------------------------------------------
 
@@ -488,6 +626,38 @@ class StrategyEngine:
              "peak": round(cycle.peak_mtm, 2), "trough": round(cycle.trough_mtm, 2),
              "legs": self._legs_snapshot()},
         )
+
+    async def _evaluate_mtm_intrabar_target(self) -> None:
+        """Intrabar target-only MTM check — runs every engine tick (1Hz).
+
+        Uses ``leg.last_price``, which ``_on_tick`` refreshes on every WS
+        tick, to compute aggregate MTM and fire MTM_TARGET the moment the
+        take-profit threshold is crossed. MAX_LOSS is NOT evaluated here —
+        it stays end-of-bar (``_evaluate_mtm`` on bar close) so a transient
+        intrabar dip doesn't force-close a cycle that would have recovered.
+        """
+        cycle = self.current_cycle
+        if not cycle or not self._mtm_ctrl:
+            return
+        if cycle.state in (CycleState.CLOSED, CycleState.EXITING):
+            return
+        if not any(leg.status == LegStatus.ACTIVE for leg in cycle.legs.values()):
+            return
+
+        unrealized = sum(leg.unrealized_pnl for leg in cycle.legs.values())
+        realized = sum(leg.realized_pnl for leg in cycle.legs.values())
+        mtm = unrealized + realized
+
+        decision = self._mtm_ctrl.evaluate_target_only(cycle, mtm)
+        if decision.exit:
+            log.info(
+                "intrabar_target_hit",
+                tag=self.tag,
+                cycle=cycle.cycle_id,
+                mtm=round(mtm, 2),
+                target=self.profile.target,
+            )
+            await self._force_close_all(decision.reason or ExitReason.MTM_TARGET)
 
     async def _force_close_all(self, reason: ExitReason) -> None:
         cycle = self.current_cycle

@@ -4,7 +4,7 @@ Mirrors the live strategy exactly:
   - Cycle opens at 09:30 IST (ATM computed from spot at that minute)
   - Base legs: ATM+6 CE (long), ATM-6 PE (long) -- both start WATCHING
   - Entry on 1-min option bar close if bar.return_pct >= 1.0 %
-  - Leg SL: entry * 0.85 for base, entry * 0.88 for lazy (close-based)
+  - Leg SL: entry * 0.85 for base, entry * 0.88 for lazy (intrabar low)
   - Lazy leg on opposite side after a base leg stops, fresh ATM, slot 3/4
   - Cycle exits on: kill (N/A here) -> session close 15:15 -> max_loss -> target -> leg SL
   - Cooldown = 0; next cycle opens on the first eligible minute after close
@@ -51,9 +51,11 @@ SESSION_START = time(9, 30)
 SESSION_END = time(15, 15)
 
 # Per-index config.
+# Lot sizes match the current NSE exchange values (NIFTY=65, BANKNIFTY=30).
+# Update here AND in configs/default.yaml if the exchange bumps lot sizes.
 INDEX_SPECS = {
-    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 75, "max_loss": 2500, "target": 300},
-    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 35, "max_loss": 2500, "target": 300},
+    "NIFTY":     {"security_id": 13, "strike_interval": 50,  "lot_size": 65, "max_loss": 2500, "target": 300},
+    "BANKNIFTY": {"security_id": 25, "strike_interval": 100, "lot_size": 30, "max_loss": 2500, "target": 300},
 }
 
 
@@ -85,7 +87,7 @@ class Leg:
     strike: int
     security_id: int = 0
     lots: int = 1
-    lot_size: int = 75
+    lot_size: int = 65
     status: Literal["WATCHING", "ACTIVE", "STOPPED", "EMPTY"] = "WATCHING"
     entry_price: float = 0.0
     sl_price: float = 0.0
@@ -369,8 +371,11 @@ async def simulate_day(
                         leg.status = "ACTIVE"
                         legs_entered += 1
                 elif leg.status == "ACTIVE":
-                    if bar.close <= leg.sl_price:
-                        leg.exit_price = bar.close
+                    # Intrabar SL trigger on bar.low (matches engine default
+                    # engine.sl_price_source='low' + backtest_2y.py + Codex
+                    # simulate_strategy_day). Fill at exactly sl_price.
+                    if bar.low <= leg.sl_price:
+                        leg.exit_price = leg.sl_price
                         leg.status = "STOPPED"
                         leg.exit_reason = "LEG_SL"
                         # Lazy-leg scheduling on opposite side.
@@ -398,20 +403,53 @@ async def simulate_day(
                                     legs.append(new)
                                     leg_bars[4] = ls_bars
 
-            # 2) Cycle MTM (realized + unrealized).
+            # 2a) Intrabar TARGET check — mark each ACTIVE leg at its
+            # bar.high and see if aggregate MTM would have crossed target
+            # at any tick inside this minute. Exit at bar.high for each
+            # ACTIVE leg. This matches the live engine, which fires
+            # MTM_TARGET off leg.last_price on every WS tick (see
+            # strategy/engine.py::_evaluate_mtm_intrabar_target).
+            # MAX_LOSS stays on bar-close in step (2b) so a transient
+            # intrabar dip doesn't force-close a cycle that recovers.
+            intrabar_realized = sum(l.realized_pnl for l in legs)
+            intrabar_unrealized = 0.0
+            active_high_prices: dict[int, float] = {}
+            for leg in legs:
+                if leg.status != "ACTIVE":
+                    continue
+                lb = leg_bars.get(leg.slot)
+                if lb is None:
+                    continue
+                bar = minute_bar_at(lb, m_now)
+                if bar is None or bar.high <= 0:
+                    continue
+                active_high_prices[leg.slot] = bar.high
+                intrabar_unrealized += (bar.high - leg.entry_price) * leg.quantity
+            intrabar_mtm = intrabar_realized + intrabar_unrealized
+            if intrabar_mtm > peak_mtm:
+                peak_mtm = intrabar_mtm
+            if intrabar_mtm >= spec["target"]:
+                for leg in legs:
+                    if leg.status != "ACTIVE":
+                        continue
+                    fill = active_high_prices.get(leg.slot)
+                    leg.exit_price = fill if fill and fill > 0 else (leg.last_price or leg.entry_price)
+                    leg.status = "STOPPED"
+                    leg.exit_reason = "MTM_TARGET"
+                cycle_exit_reason = "MTM_TARGET"
+                break
+
+            # 2b) Bar-close MTM — for MAX_LOSS gating and trough tracking.
             mtm = sum(l.realized_pnl for l in legs) + sum(l.unrealized_pnl for l in legs)
             if mtm > peak_mtm:
                 peak_mtm = mtm
             if mtm < trough_mtm:
                 trough_mtm = mtm
 
-            # 3) Exit checks — priority: session_close, max_loss, target.
-            # Session-close handled below on loop exit.
+            # 3) Exit checks — priority: session_close, max_loss.
+            # (target already handled intrabar above; session-close on loop exit.)
             if mtm <= -abs(spec["max_loss"]):
                 cycle_exit_reason = "MTM_MAX_LOSS"
-                break
-            if mtm >= spec["target"]:
-                cycle_exit_reason = "MTM_TARGET"
                 break
 
             # 4) Session close

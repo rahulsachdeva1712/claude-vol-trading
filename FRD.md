@@ -26,8 +26,17 @@ authoritative specification for the development team.
 - Strategy configuration management
 - Per-cycle and per-session trade logging and P&L reporting
 
-> **Non-goals (v0.x)**: historical backtesting, multi-strategy hosting,
-> portfolio-level risk, execution algos beyond plain market orders.
+> **Non-goals (v0.x)**: multi-strategy hosting, portfolio-level risk,
+> execution algos beyond plain market orders. Historical backtesting is
+> **not part of the application runtime** — the live process does not
+> backtest, there is no backtest UI, and no `scripts/backtest_*.py` code
+> is imported by `src/volscalp/*`. Standalone developer-only research
+> scripts under `scripts/` (`rollingoption_probe.py`,
+> `backtest_history_fetch.py`, `backtest_2y.py`) use Dhan's
+> `/v2/charts/rollingoption` endpoint (Expired Options Data add-on) to
+> replay the strategy offline over multi-year windows. These scripts
+> share strategy constants with the engine by duplication, not import;
+> any change to entry/exit/MTM rules must be mirrored in both places.
 
 ### 1.3 Definitions
 - **ATM**: At-the-Money — the strike closest to the current underlying spot price.
@@ -38,7 +47,7 @@ authoritative specification for the development team.
 - **Cycle**: One complete entry-to-exit sequence from entry through MTM or SL close.
 - **MTM**: Mark-to-Market — real-time unrealised P&L for all open legs in the cycle.
 - **Leg SL**: Individual option leg stop-loss, calculated from leg entry price.
-- **Lock & Trail**: (removed) MTM profit locking mechanism — locked a floor once a threshold was crossed, then trailed upward. Deleted in the 4-engine cleanup (§5.2).
+- **Lock & Trail**: *(removed 2026-04)* Evaluated as a protective profit-floor ratchet on cycle MTM; did not improve P&L vs the plain `max_loss`/`target` pair in the 2y backtest and was stripped from all surfaces. Kept here for glossary completeness only.
 - **Momentum Filter**: Minimum candle return required on the option's own bar before a leg entry is triggered.
 - **Bar**: One OHLCV candle on the options data feed; minimum engine granularity.
 
@@ -60,8 +69,9 @@ risk controls.
 | 1    | 09:15–09:29 | App initialises, loads config, establishes data feed, computes initial ATM. |
 | 2    | 09:30       | Cycle 1 starts. Begin watching ATM+6 CE and ATM-6 PE for momentum entry. |
 | 3    | Per bar     | Check entry condition for each unentered base leg. Enter on first qualifying bar. |
-| 4    | Per bar     | For entered legs: check leg SL. Check cycle-level MTM target / max loss.          |
-| 5    | Base leg SL | Schedule lazy leg entry for opposite side if not yet opened in this cycle. |
+| 4    | Per bar     | For entered legs: check leg SL. Check cycle-level MTM `max_loss` (bar-close). |
+| 4b   | Per tick    | Check cycle-level MTM `target` intrabar (1 Hz) against current LTP. See §5.2. |
+| 5    | Base leg SL | Immediately enter opposite-side lazy leg (no momentum gate) if not yet opened in this cycle. |
 | 6    | Cycle exit  | Close all open legs. Record cycle P&L.                                 |
 | 7    | Next bar    | Start next cycle immediately (cooldown = 0 minutes).                   |
 | 8    | 15:15       | Force-close all open positions. End session. Generate session report.  |
@@ -72,6 +82,8 @@ risk controls.
 | Strategy Structure     | OTM Strangle     | OTM Strangle     |
 | Strike Offset CE       | ATM + 6          | ATM + 6          |
 | Strike Offset PE       | ATM - 6          | ATM - 6          |
+| Strike Interval        | 50               | 100              |
+| Lot Size (NSE)         | 65               | 30               |
 | Momentum Threshold     | 1% per bar       | 1% per bar       |
 | Lazy Mode              | Enabled          | Enabled          |
 | MTM Risk Profile       | max_loss=Rs.2500, target=Rs.300 | max_loss=Rs.2500, target=Rs.300 |
@@ -80,6 +92,14 @@ risk controls.
 | Session Close          | 15:15            | 15:15            |
 | Cooldown Between Cycles| 0 minutes        | 0 minutes        |
 | Expiry                 | Monthly          | Monthly          |
+
+> **Lot size source of truth:** `configs/default.yaml` → `instruments.<IDX>.lot_size`.
+> Developer-only backtest scripts (`scripts/backtest_2y.py`,
+> `scripts/backtest.py`) duplicate these constants in their own
+> `INDEX_SPECS` table and **must be kept in sync** whenever the exchange
+> revises lot sizes. The same rule applies to strike offsets — the live
+> engine uses `engine.strike_offset_ce/pe = ±6`, and the backtest fetcher
+> (`scripts/backtest_history_fetch.py --fan`) defaults to `6` to match.
 
 ---
 
@@ -125,10 +145,17 @@ Lazy legs are recovery legs opened on one side when the base leg on the opposite
 | Base Put (PE) SL hit     | Schedule Lazy Call (CE) entry|
 
 ### 4.3 Entry Rules for Lazy Legs
-- A lazy leg uses the same momentum entry condition as a base leg (>=1% candle return on the new strike's bar).
+- A lazy leg enters **immediately at the bar close of the minute its
+  opposite base leg was stopped** — there is **no momentum gate** on the
+  lazy side (aggregate-MTM semantics: the cycle is already "in recovery"
+  and we want symmetric coverage at once, not a second filter).
+- Entry price is that stop-minute bar's close on the fresh lazy
+  instrument (fallback: last known LTP if no fresh bar has formed).
 - The strike for the lazy leg is computed **fresh from the current ATM at the time of scheduling** — it is NOT the same strike as the stopped base leg.
 - Only one lazy CE and one lazy PE may be open per cycle. Duplicate lazy entries are blocked.
-- If the lazy leg's momentum condition is never met before cycle exit, the lazy leg is not entered.
+- If the lazy instrument cannot be resolved (out of the subscribed strike
+  fan, or no price available), the slot is marked EMPTY and no entry is
+  attempted — the cycle continues on whatever legs remain.
 
 ### 4.4 Maximum Legs Per Cycle
 | Slot | Type           | Description                                       |
@@ -151,29 +178,76 @@ Maximum 4 active legs at any point within a single cycle.
 | Lazy Leg  | Entry * (1 - 0.12)    | Stop at Rs.88.00        |
 
 - Stop price is fixed at entry and does not change during the leg's life.
-- The stop is evaluated on each bar's close price (configurable: low price for intrabar simulation).
+- The stop is evaluated **intrabar on the bar's low by default** (`engine.sl_price_source: low` in `configs/default.yaml`). This matches Codex's `simulate_strategy_day` trigger and the 2y backtest's intrabar check, so backtest, paper, and live all fire stops on the same bar. Configurable to `close` for a more conservative "end-of-bar" simulation.
 - When a leg is stopped, it is exited at the stop price (slippage configurable; default none).
+- **Per-strike tape after entry.** Once a leg is ACTIVE, it follows the
+  entry-captured absolute strike — not the rolling "ATM±N" label (which
+  would re-point at a different strike as spot drifts). The strike's
+  minute-by-minute bars are only loaded while the strike sat within the
+  ±6 strike fan (matching the live engine's subscription window and
+  Codex's `MAX_STRIKE_SHIFT=6`). If the strike drifts beyond ±6, its bar
+  is absent for the gap; MTM / exit fills then use the most recent
+  available close (`_get_row_at_or_before` semantic). This keeps
+  backtest and live seeing an identical tape: **neither can trigger a
+  leg SL on a minute the live engine isn't subscribed to.**
 
 ### 5.2 Strategy-Level MTM Controls
-MTM controls operate at the **cycle level** — they monitor the combined P&L of all open legs within the current cycle.
+MTM controls operate at the **cycle level** — they monitor the combined P&L
+of **all legs in the current cycle** (realised P&L of stopped legs +
+unrealised P&L of open legs). A single aggregate breach closes the
+whole cycle at once.
 
-Lock-and-trail was evaluated and removed (backtests showed no material
-improvement at the horizons we trade). The cycle has two thresholds only:
-`max_loss` (hard stop) and `target` (take-profit).
+The cycle has two thresholds evaluated on different cadences:
+
+- **`max_loss`** (hard stop) — evaluated on **bar close** only. The
+  end-of-bar evaluation absorbs transient intrabar dips, so a spike
+  that would have force-closed at the bottom of a minute but
+  recovered by the bar close does not blow up the cycle.
+- **`target`** (take-profit) — evaluated **intrabar**, on every engine
+  tick (1 Hz). The live/paper engine uses each leg's current LTP
+  (refreshed by the WS feed on every tick); the backtest approximates
+  simultaneous intrabar prices with each ACTIVE leg's bar high. As
+  soon as aggregate MTM crosses `target`, all ACTIVE legs exit at the
+  trigger-moment price. Backtest April 2026 (15 sessions) showed +55 %
+  cycle count and +55 % P&L versus the same target evaluated on bar
+  close, with MAX_LOSS cadence unchanged.
 
 **NIFTY**
 
-| Control  | Value    | Behaviour                                  |
-|----------|----------|--------------------------------------------|
-| Max Loss | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500   |
-| Target   | Rs.300   | Exit all legs when cycle MTM >=  Rs.300    |
+| Control    | Value    | Behaviour                                      |
+|------------|----------|------------------------------------------------|
+| Max Loss   | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500       |
+| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300        |
 
 **BANKNIFTY**
 
-| Control  | Value    | Behaviour                                  |
-|----------|----------|--------------------------------------------|
-| Max Loss | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500   |
-| Target   | Rs.300   | Exit all legs when cycle MTM >=  Rs.300    |
+| Control    | Value    | Behaviour                                      |
+|------------|----------|------------------------------------------------|
+| Max Loss   | Rs.2500  | Exit all legs when cycle MTM <= -Rs.2500       |
+| Target     | Rs.300   | Exit all legs when cycle MTM >=  Rs.300        |
+
+**Lock-and-trail was evaluated and removed (2026-04).** A ratcheting
+profit-floor was previously wired in mirroring Codex's "Tight MTM"
+profile (`spread_lab.py`), but it did not improve P&L vs the plain
+`max_loss`/`target` pair in the 2y backtest. The four knobs
+(`lock_start`, `lock_profit`, `trail_step`, `trail_lock_step`) and the
+`ExitReason.LOCK_TRAIL` enum value have been removed from configs,
+models, the paper/live engine, and both backtest scripts.
+
+**Aggregate-MTM semantics (important):**
+
+- The threshold is evaluated **only while at least one leg is ACTIVE** —
+  once every leg has closed, there is nothing left to mark to market and
+  the cycle's P&L is fully realised. At that point the cycle is
+  considered **done** (see §6.1) regardless of whether a threshold was
+  hit, and its exit reason is inherited from the most recently stopped
+  leg (typically `LEG_SL`).
+- When the aggregate target / max-loss does fire, **all currently-open
+  legs are force-closed on that bar**, and their individual exit reason
+  is recorded as the cycle's MTM reason (not `LEG_SL`).
+- A leg that already stopped via `LEG_SL` earlier in the cycle keeps its
+  own `LEG_SL` exit reason — the cycle-level reason only applies to legs
+  that were still open at the force-close minute.
 
 ### 5.3 Session Close
 - At **15:15**, all open legs across all active cycles are forcibly closed at prevailing market price.
@@ -184,9 +258,16 @@ improvement at the horizons we trade). The cycle has two thresholds only:
 When multiple exit conditions could apply simultaneously, priority is:
 1. Kill switch (live only — disarms + flattens all live cycles)
 2. Session close at 15:15 (always overrides 3-5)
-3. Overall MTM max loss breached
-4. Overall MTM target reached
-5. Individual leg SL hit (exits only that leg, cycle continues)
+3. Overall MTM max loss breached (`MTM_MAX_LOSS`) — evaluated on bar close
+4. Overall MTM target reached (`MTM_TARGET`) — evaluated intrabar (1 Hz tick)
+5. Individual leg SL hit (`LEG_SL` — exits only that leg, cycle continues)
+
+Priority here is evaluation-cadence-aware: an intrabar target hit at
+09:40:37 fires immediately, even though MAX_LOSS for the same minute
+wouldn't have been evaluated until the 09:41 bar close. This is
+intentional — capturing take-profits the moment they're available is
+strictly additive, whereas MAX_LOSS is a hard stop whose job is to
+tolerate normal intra-minute volatility (see §5.2).
 
 ---
 
@@ -197,6 +278,26 @@ When multiple exit conditions could apply simultaneously, priority is:
 - Cooldown = 0 minutes. Next cycle starts on the first available bar after the exit bar.
 - All cycle state (MTM accumulator, leg positions, lazy flags) is fully reset between cycles.
 - Session-level state (total session P&L, cycle counter) accumulates across all cycles.
+
+**Cycle-done detection (aggregate-MTM corollary):**
+
+A cycle does not have to end via an MTM threshold to be considered done.
+A cycle is **done** (and the next cycle starts on the following bar) as
+soon as one of these holds:
+
+1. Aggregate MTM trigger fired — `MTM_TARGET` or `MTM_MAX_LOSS` closed
+   all open legs.
+2. Session close (15:15) — force-closes everything.
+3. **No leg is alive** — every leg slot is either `STOPPED` (exited on
+   its own `LEG_SL`) or `EMPTY` (strike missing / order rejected), and
+   there is no leg in `WATCHING`, `PENDING`, `ACTIVE`, or `EXITING`.
+   When this happens the cycle's exit reason is inherited from the
+   most recently stopped leg.
+
+Without case 3, a cycle whose both base legs SL out — and no lazy
+is eligible (or the lazy is still watching for momentum and never fires) —
+would idle to session close and block every subsequent cycle for the
+day. The detector is evaluated on every engine tick.
 
 ### 6.2 Cycle State Machine
 | State     | Entry Condition          | Transitions                                          |
@@ -249,7 +350,7 @@ Fields reset at each new cycle start:
 | M-01 | Config Manager       | Load, validate, and expose all strategy and risk parameters.                 |
 | M-02 | Market Data Service  | Connect to broker/exchange feed; normalise and cache OHLCV bars.             |
 | M-03 | ATM Calculator       | Compute ATM and strike offsets from spot price on each bar.                  |
-| M-04 | Entry Engine         | Apply momentum filter; schedule and execute base and lazy leg entries.       |
+| M-04 | Entry Engine         | Apply momentum filter to base legs; immediately enter opposite lazy leg when a base leg SLs. |
 | M-05 | Position Manager     | Track all open legs, compute leg-level MTM, enforce leg SLs.                 |
 | M-06 | MTM Controller       | Evaluate cycle-level MTM; trigger exits on max_loss or target.               |
 | M-07 | Cycle Manager        | Manage cycle state machine, reset between cycles, schedule next cycle.       |
@@ -313,14 +414,15 @@ intended — paper is an idealised twin, not a strict mirror.
 | lots_per_trade_live    | 1       | Lots per leg — live engines (UI-editable per mode)    |
 
 ### 9.2 MTM Profile Parameters
-| Parameter    | NIFTY    | BANKNIFTY | Description                              |
-|--------------|----------|-----------|------------------------------------------|
-| mtm_max_loss | Rs.2500  | Rs.2500   | Max cycle loss                           |
-| mtm_target   | Rs.300   | Rs.300    | Cycle profit target                      |
+| Parameter        | NIFTY    | BANKNIFTY | Description                                                |
+|------------------|----------|-----------|------------------------------------------------------------|
+| max_loss         | Rs.2500  | Rs.2500   | Max cycle loss — force-close at bar close when cycle MTM <= -max_loss |
+| target           | Rs.300   | Rs.300    | Cycle profit target — force-close intrabar (1 Hz tick) when cycle MTM >= target |
 
-Lock-and-trail fields (`lock_activation`, `lock_floor`, `trail_step`) were
-removed. See §5.2 for rationale. The `ExitReason.LOCK_TRAIL_FLOOR` enum
-value has been dropped accordingly.
+Lock-and-trail fields (`lock_start`, `lock_profit`, `trail_step`,
+`trail_lock_step`) and the `ExitReason.LOCK_TRAIL` enum value were
+removed in 2026-04 after backtesting showed no P&L improvement over the
+plain `max_loss`/`target` pair.
 
 ---
 
@@ -423,7 +525,13 @@ or `unavailable` (when Dhan credentials are absent).
 ### 12.1 Assumptions
 - Entry price is the Close of the triggering bar. If next-bar-open fills are required, this must be explicitly configured.
 - Stop loss is evaluated on bar Close, not intrabar Low (conservative). Intrabar tick SL is a configurable enhancement.
-- Lot size and quantity are configurable outside this document and not part of core strategy logic.
+- Lot size tracks the NSE-published contract size for each index (currently
+  NIFTY=65, BANKNIFTY=30 — see §2.3). The number is configurable in
+  `configs/default.yaml`; any revision must also be mirrored in the
+  developer backtest scripts, which keep their own copy of the constant.
+  Because MTM thresholds (`max_loss`, `target`) are denominated in rupees,
+  changing lot size shifts when those thresholds fire and can reroute a
+  session's cycle schedule even though the strategy rules are unchanged.
 - ATM is the nearest listed strike to spot. If spot falls exactly between two strikes, the lower strike is selected (configurable).
 
 ### 12.2 Answers to Open Questions

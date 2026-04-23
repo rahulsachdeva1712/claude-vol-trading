@@ -51,16 +51,25 @@ class EngineConfig(BaseModel):
     lazy_leg_sl_pct: float = 12.0
     lazy_enabled: bool = True
     entry_price_source: Literal["close", "next_open"] = "close"
-    sl_price_source: Literal["close", "low"] = "close"
+    sl_price_source: Literal["close", "low"] = "low"
     lots_per_trade_paper: int = 1
     lots_per_trade_live: int = 1
     max_concurrent_cycles: int = 2
 
 
 class MtmProfile(BaseModel):
-    """Cycle exit thresholds. Only max_loss and target are used — lock-and-trail
-    was removed because backtests showed it didn't move the needle at our
-    per-cycle horizons."""
+    """Cycle exit thresholds.
+
+    Aggregate-MTM (realised + unrealised) is checked every bar in this
+    priority order:
+
+        1. ``mtm <= -max_loss``   → MTM_MAX_LOSS
+        2. ``mtm >= target``      → MTM_TARGET
+
+    Lock-and-trail was evaluated and removed (2026-04): it did not
+    improve P&L vs the straight max_loss/target pair in the 2y backtest
+    and added complexity.
+    """
     max_loss: float
     target: float
 
