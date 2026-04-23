@@ -61,24 +61,17 @@ class MtmProfile(BaseModel):
     """Cycle exit thresholds.
 
     Aggregate-MTM (realised + unrealised) is checked every bar in this
-    priority order, mirroring Codex's ``simulate_strategy_day``:
+    priority order:
 
         1. ``mtm <= -max_loss``   → MTM_MAX_LOSS
         2. ``mtm >= target``      → MTM_TARGET
-        3. ``mtm <= lock_floor``  → LOCK_TRAIL
-           (only active once peak has crossed ``lock_start``)
 
-    Lock-and-trail ratchets: once ``peak >= lock_start``, the floor starts
-    at ``lock_profit`` and moves up by ``trail_lock_step`` for every full
-    ``trail_step`` rupees of peak above ``lock_start``. Set the lock
-    fields to ``None`` (or leave defaults) to disable the ratchet.
+    Lock-and-trail was evaluated and removed (2026-04): it did not
+    improve P&L vs the straight max_loss/target pair in the 2y backtest
+    and added complexity.
     """
     max_loss: float
     target: float
-    lock_start: float | None = None
-    lock_profit: float | None = None
-    trail_step: float | None = None
-    trail_lock_step: float | None = None
 
 
 class InstrumentConfig(BaseModel):

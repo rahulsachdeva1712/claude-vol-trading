@@ -31,25 +31,17 @@ engine:
 
 # Aggregate-MTM exit: (realised + unrealised) summed across all legs of
 # the current cycle is evaluated every bar, priority
-#   max_loss → target → lock_trail (once armed).
-# Values mirror Codex's "Tight MTM" profile (spread_lab.py) which is the
-# configuration the 2y replay is validated against. Dashboard UI can
-# override any of these per-index at runtime.
+#   max_loss → target.
+# Lock-and-trail was evaluated and removed (2026-04) — it did not improve
+# P&L in backtests and added complexity. Dashboard UI can override any of
+# these per-index at runtime.
 mtm_profiles:
   NIFTY:
-    max_loss: 3500
+    max_loss: 2500
     target:    300
-    lock_start:      500      # arm trail once peak crosses this
-    lock_profit:     350      # initial protective floor when armed
-    trail_step:      100      # raise floor every +100 of peak beyond lock_start
-    trail_lock_step: 100      # by this much each step
   BANKNIFTY:
-    max_loss: 3500
+    max_loss: 2500
     target:    300
-    lock_start:      500
-    lock_profit:     350
-    trail_step:      100
-    trail_lock_step: 100
 
 instruments:
   # Dhan uses SecurityId + ExchangeSegment. These are populated from the
