@@ -47,7 +47,7 @@ authoritative specification for the development team.
 - **Cycle**: One complete entry-to-exit sequence from entry through MTM or SL close.
 - **MTM**: Mark-to-Market — real-time unrealised P&L for all open legs in the cycle.
 - **Leg SL**: Individual option leg stop-loss, calculated from leg entry price.
-- **Lock & Trail**: *(removed 2026-04)* Evaluated as a protective profit-floor ratchet on cycle MTM; did not improve P&L vs the plain `max_loss`/`target` pair in the 2y backtest and was stripped from all surfaces. Kept here for glossary completeness only.
+- **Lock & Trail**: *(removed 2026-04)* Evaluated as a protective profit-floor ratchet on cycle MTM; did not improve P&L vs the plain `max_loss`/`target` pair in the 2y backtest and was stripped from all surfaces. A session-level variant (daily cumulative-P&L trail + daily-loss limit, with soft/hard halt modes) was evaluated in 2026-04 via `scripts/backtest_2y.py --session-*` flags over a 228 index-session, 4,809-cycle sweep (see `out/backtest_session_lock_trail.md`); every non-baseline config underperformed, so it was left as opt-in CLI flags on the backtest only — not promoted into the paper or live engines. Kept here for glossary completeness.
 - **Momentum Filter**: Minimum candle return required on the option's own bar before a leg entry is triggered.
 - **Bar**: One OHLCV candle on the options data feed; minimum engine granularity.
 - **Fill-ack bridge**: The reconciler loop that polls Dhan `/positions`
