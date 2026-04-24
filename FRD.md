@@ -448,7 +448,20 @@ Both tabs display:
   - Average P&L per Closed Trade
   - Profit Factor
   - Max Drawdown
-- Closed-trades table + cumulative P&L chart — scoped to the selected mode's session.
+- Closed-trades table — scoped to the selected mode, **today only** (rolls
+  up all of today's cycles across any process restarts on the same date).
+- **Two P&L curves** per tab, both server-scoped by mode:
+  - **Today's P&L curve** — cumulative cycle-by-cycle realised P&L for
+    the current session date. X-axis is cycle number, resets daily.
+    Empty-state placeholder shown when no cycle has closed yet today.
+    Source: `GET /api/closed_trades?mode=` (same data as the closed-trades
+    table).
+  - **Cumulative P&L across days** — one point per trading day,
+    running sum of closed-cycle P&L across every session ever
+    recorded. X-axis is `session_date`. The rightmost y-value equals
+    the KPI strip's "Cumulative P&L" figure — the KPI is just this
+    series' tail. Empty-state placeholder shown when no cycle has
+    ever closed for this mode. Source: `GET /api/equity_curve?mode=`.
 
 Per-tab controls:
 - `Paper` tab:

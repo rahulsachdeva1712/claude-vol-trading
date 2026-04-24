@@ -70,6 +70,8 @@ header button.danger:hover { background: #53202c; }
 
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; margin: 14px 18px; padding: 14px; }
 .card h2 { margin: 0 0 10px 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
+.card h2 small { font-size: 11px; color: var(--muted); text-transform: none; letter-spacing: 0; margin-left: 6px; font-weight: normal; }
+.chart-empty { padding: 24px 0; text-align: center; color: var(--muted); font-size: 12px; }
 
 .cycle-panel .cycle-head { display: flex; justify-content: space-between; margin-bottom: 8px; }
 .cycle-panel .cycle-head .mtm { font-size: 22px; font-weight: 700; }

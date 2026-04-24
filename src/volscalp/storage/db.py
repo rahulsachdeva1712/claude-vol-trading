@@ -253,6 +253,43 @@ class Database:
                 "exit_reason", "started_at", "ended_at", "session_date"]
         return [dict(zip(cols, r)) for r in rows]
 
+    async def fetch_daily_pnl(self, mode_label: str) -> list[dict[str, Any]]:
+        """One row per trading day with that day's realised P&L, across
+        every session ever recorded for this mode (paper | live). Rows
+        are returned oldest-first so the caller can build a cumulative
+        equity curve by running-sum without re-sorting.
+
+        Used by the dashboard's "Cumulative P&L across days" chart
+        (FRD §10.1). A day with only open cycles (nothing closed) is
+        omitted — we only count cycles with `ended_at IS NOT NULL`, so
+        cycle_pnl is the realised figure.
+        """
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT s.session_date,
+                      COALESCE(SUM(c.cycle_pnl), 0) AS day_pnl,
+                      COUNT(c.id)                   AS closed_cycles
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.ended_at IS NOT NULL
+               GROUP BY s.session_date
+               ORDER BY s.session_date ASC""",
+            (mode_label,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        cum = 0.0
+        for session_date, day_pnl, closed_cycles in rows:
+            day_pnl_f = float(day_pnl or 0.0)
+            cum += day_pnl_f
+            out.append({
+                "session_date": session_date,
+                "day_pnl": day_pnl_f,
+                "cum_pnl": cum,
+                "closed_cycles": int(closed_cycles or 0),
+            })
+        return out
+
     async def fetch_closed_trades_today(
         self, mode_label: str, today_date: str
     ) -> list[dict[str, Any]]:

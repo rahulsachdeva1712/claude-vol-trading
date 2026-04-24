@@ -8,10 +8,14 @@
   const state = {
     snapshot: null,
     activeMode: 'paper',
-    charts: {},                 // mode -> Chart instance
+    charts: {},                 // 'pnl-<mode>' | 'equity-<mode>' -> Chart
     chartData: {
-      paper: { labels: [], datasets: [{ label: 'Cumulative P&L (paper)', data: [], tension: 0.25, fill: false, borderColor: '#5aa0ff' }] },
-      live:  { labels: [], datasets: [{ label: 'Cumulative P&L (live)',  data: [], tension: 0.25, fill: false, borderColor: '#f2a83b' }] },
+      // Today's P&L — cumulative across cycles inside the current session
+      'pnl-paper':    { labels: [], datasets: [{ label: "Today's P&L (paper)", data: [], tension: 0.25, fill: false, borderColor: '#5aa0ff' }] },
+      'pnl-live':     { labels: [], datasets: [{ label: "Today's P&L (live)",  data: [], tension: 0.25, fill: false, borderColor: '#f2a83b' }] },
+      // Lifetime equity curve — one point per trading day
+      'equity-paper': { labels: [], datasets: [{ label: 'Cumulative P&L across days (paper)', data: [], tension: 0.25, fill: false, borderColor: '#5aa0ff' }] },
+      'equity-live':  { labels: [], datasets: [{ label: 'Cumulative P&L across days (live)',  data: [], tension: 0.25, fill: false, borderColor: '#f2a83b' }] },
     },
   };
 
@@ -94,34 +98,62 @@
     ).join('');
   }
 
-  function renderPnlChart(mode, trades) {
-    const ctx = $('pnl-chart-' + mode);
+  // Shared Chart.js options — same look for both charts.
+  function chartOptions() {
+    return {
+      responsive: true,
+      animation: false,
+      plugins: { legend: { labels: { color: '#e6eaf2' } } },
+      scales: {
+        x: { ticks: { color: '#8a93a6' }, grid: { color: '#242a36' } },
+        y: { ticks: { color: '#8a93a6' }, grid: { color: '#242a36' } },
+      },
+    };
+  }
+
+  // Render or update a line chart by key ('pnl-<mode>' | 'equity-<mode>').
+  // Hides the canvas and shows a sibling .chart-empty div when there's no data,
+  // so Chart.js never draws an orphan axis.
+  function renderLineChart(key, canvasId, emptyId, labels, data) {
+    const ctx = $(canvasId);
+    const empty = $(emptyId);
     if (!ctx) return;
-    const ctx2 = ctx.getContext('2d');
+    const hasData = labels.length > 0 && data.length > 0;
+    if (empty) empty.classList.toggle('hidden', hasData);
+    ctx.classList.toggle('hidden', !hasData);
+    if (!hasData) return;
+
+    state.chartData[key].labels = labels;
+    state.chartData[key].datasets[0].data = data;
+
+    if (!state.charts[key]) {
+      state.charts[key] = new Chart(ctx.getContext('2d'), {
+        type: 'line',
+        data: state.chartData[key],
+        options: chartOptions(),
+      });
+    } else {
+      state.charts[key].update();
+    }
+  }
+
+  // Today's P&L — cumulative across cycles inside the current session.
+  // `trades` is newest-first from /api/closed_trades (today scope).
+  function renderPnlChart(mode, trades) {
     const sorted = (trades || []).slice().reverse();
     const labels = sorted.map(t => '#' + t.cycle_no);
     let cum = 0;
     const data = sorted.map(t => { cum += Number(t.cycle_pnl) || 0; return cum; });
-    state.chartData[mode].labels = labels;
-    state.chartData[mode].datasets[0].data = data;
+    renderLineChart('pnl-' + mode, 'pnl-chart-' + mode, 'pnl-empty-' + mode, labels, data);
+  }
 
-    if (!state.charts[mode]) {
-      state.charts[mode] = new Chart(ctx2, {
-        type: 'line',
-        data: state.chartData[mode],
-        options: {
-          responsive: true,
-          animation: false,
-          plugins: { legend: { labels: { color: '#e6eaf2' } } },
-          scales: {
-            x: { ticks: { color: '#8a93a6' }, grid: { color: '#242a36' } },
-            y: { ticks: { color: '#8a93a6' }, grid: { color: '#242a36' } },
-          },
-        },
-      });
-    } else {
-      state.charts[mode].update();
-    }
+  // Lifetime equity curve — one point per trading day from /api/equity_curve.
+  // The rightmost y-value equals the KPI strip's "Cumulative P&L".
+  function renderEquityChart(mode, days) {
+    const rows = days || [];
+    const labels = rows.map(d => d.session_date);
+    const data = rows.map(d => Number(d.cum_pnl) || 0);
+    renderLineChart('equity-' + mode, 'equity-chart-' + mode, 'equity-empty-' + mode, labels, data);
   }
 
   function renderLiveControls(snap) {
@@ -174,11 +206,19 @@
 
   async function fetchTrades(mode) {
     try {
-      const res = await fetch('/api/closed_trades?mode=' + mode);
-      if (!res.ok) return;
-      const body = await res.json();
-      renderTrades(mode, body.trades || []);
-      renderPnlChart(mode, body.trades || []);
+      const [tradesRes, equityRes] = await Promise.all([
+        fetch('/api/closed_trades?mode=' + mode),
+        fetch('/api/equity_curve?mode=' + mode),
+      ]);
+      if (tradesRes.ok) {
+        const body = await tradesRes.json();
+        renderTrades(mode, body.trades || []);
+        renderPnlChart(mode, body.trades || []);
+      }
+      if (equityRes.ok) {
+        const body = await equityRes.json();
+        renderEquityChart(mode, body.days || []);
+      }
     } catch (e) { /* ignore */ }
   }
 

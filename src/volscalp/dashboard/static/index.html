@@ -49,8 +49,15 @@
       </section>
 
       <section class="card">
-        <h2>P&amp;L curve — paper</h2>
+        <h2>Today's P&amp;L curve — paper <small>(session scope, resets daily)</small></h2>
+        <div id="pnl-empty-paper" class="chart-empty hidden"><em>no closed trades today yet</em></div>
         <canvas id="pnl-chart-paper" height="120"></canvas>
+      </section>
+
+      <section class="card">
+        <h2>Cumulative P&amp;L across days — paper <small>(lifetime; matches the KPI)</small></h2>
+        <div id="equity-empty-paper" class="chart-empty hidden"><em>no closed trades on record yet</em></div>
+        <canvas id="equity-chart-paper" height="120"></canvas>
       </section>
 
       <section class="card">
@@ -98,8 +105,15 @@
       </section>
 
       <section class="card">
-        <h2>P&amp;L curve — live</h2>
+        <h2>Today's P&amp;L curve — live <small>(session scope, resets daily)</small></h2>
+        <div id="pnl-empty-live" class="chart-empty hidden"><em>no closed trades today yet</em></div>
         <canvas id="pnl-chart-live" height="120"></canvas>
+      </section>
+
+      <section class="card">
+        <h2>Cumulative P&amp;L across days — live <small>(lifetime; matches the KPI)</small></h2>
+        <div id="equity-empty-live" class="chart-empty hidden"><em>no closed trades on record yet</em></div>
+        <canvas id="equity-chart-live" height="120"></canvas>
       </section>
 
       <section class="card">

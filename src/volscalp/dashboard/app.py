@@ -3,7 +3,8 @@
 Endpoints:
     GET  /                         — static SPA (index.html)
     GET  /api/status               — snapshot of both modes
-    GET  /api/closed_trades?mode=  — closed cycles for one mode
+    GET  /api/closed_trades?mode=  — closed cycles for one mode (today only)
+    GET  /api/equity_curve?mode=   — per-day cumulative P&L across all sessions
     POST /api/config               — runtime params (per-mode lots_per_trade)
     POST /api/live/arm             — arm live entries (requires 'confirm': true)
     POST /api/live/disarm          — disarm live entries
@@ -93,6 +94,18 @@ def create_app(state) -> FastAPI:
         today_iso = datetime.now(tz).date().isoformat()
         rows = await state.db.fetch_closed_trades_today(mode_l, today_iso)
         return {"mode": mode_l, "trades": rows}
+
+    @app.get("/api/equity_curve")
+    async def equity_curve(mode: str = "paper") -> dict[str, Any]:
+        """One point per trading day with running cumulative P&L across
+        every session ever recorded for the mode (FRD §10.1). The
+        rightmost `cum_pnl` value equals the KPI strip's "Cumulative
+        P&L" figure — the KPI is just this series' tail."""
+        mode_l = mode.lower()
+        if mode_l not in ("paper", "live"):
+            raise HTTPException(400, "mode must be 'paper' or 'live'")
+        days = await state.db.fetch_daily_pnl(mode_l)
+        return {"mode": mode_l, "days": days}
 
     @app.post("/api/config")
     async def update_config(req: Request) -> dict[str, Any]:
