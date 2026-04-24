@@ -36,8 +36,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import uvicorn
 
@@ -191,9 +193,19 @@ class RuntimeState:
                 "realized_pnl": round(realized_total, 2),
                 "unrealized_pnl": round(unrealized_total, 2),
                 "total_mtm": round(realized_total + unrealized_total, 2),
-                # Cumulative across ALL recorded sessions for this mode —
-                # pulled from SQLite, so it persists across restarts.
-                "cumulative_pnl": round(self.cumulative_pnl_by_mode.get(tree.mode, 0.0), 2),
+                # Cumulative across ALL recorded sessions for this mode.
+                # `cumulative_pnl_by_mode` holds the PRIOR-days sum
+                # pulled from SQLite (refreshed every 5 s, survives
+                # restarts); `realized_total` is today's per-engine
+                # aggregate which for live is Dhan's broker-sourced
+                # figure. Combining them keeps cumulative in sync with
+                # "Today Realized" on a day with no prior sessions and
+                # avoids the internal-vs-broker divergence that used to
+                # make the two KPIs disagree by brokerage + slippage.
+                # See FRD §11.4.
+                "cumulative_pnl": round(
+                    self.cumulative_pnl_by_mode.get(tree.mode, 0.0) + realized_total, 2,
+                ),
                 "open_positions": open_positions,
                 "closed_cycles": closed_total,
                 "win_rate_pct": round(win_rate, 1),
@@ -481,11 +493,25 @@ async def _run(cfg: AppConfig) -> int:
         reconciler_task = asyncio.create_task(state.reconciler.run(), name="reconciler")
 
     async def cumulative_pnl_refresher() -> None:
-        """Keep state.cumulative_pnl_by_mode in sync with SQLite every 5 s."""
+        """Keep state.cumulative_pnl_by_mode in sync with SQLite every 5 s.
+
+        Stores the sum of closed-cycle P&L for PRIOR days only. The
+        snapshot adds today's realized (per-mode aggregate — broker-
+        sourced for live, internal for paper) on top. This way a day
+        with zero prior sessions yields cumulative == today's realized,
+        and the live "Today Realized" + "Cumulative" KPIs reconcile
+        without divergence from brokerage/slippage. See FRD §11.4.
+        """
+        tz = ZoneInfo(cfg.session.timezone)
         while not shutdown_event().is_set():
+            today_iso = datetime.now(tz).date().isoformat()
             for mode in state.modes:
                 try:
-                    state.cumulative_pnl_by_mode[mode] = await db.fetch_mode_cumulative_pnl(mode.value)
+                    state.cumulative_pnl_by_mode[mode] = (
+                        await db.fetch_mode_cumulative_pnl_before_date(
+                            mode.value, today_iso,
+                        )
+                    )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("cumulative_pnl_refresh_error", mode=mode.value, error=str(exc))
             try:

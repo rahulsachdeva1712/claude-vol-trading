@@ -258,6 +258,27 @@ class Database:
             row = await cur.fetchone()
         return float(row[0]) if row and row[0] is not None else 0.0
 
+    async def fetch_mode_cumulative_pnl_before_date(
+        self, mode_label: str, session_date_iso: str,
+    ) -> float:
+        """Sum of closed-cycle P&L across every session BEFORE the given
+        date for this mode. Used to build a hybrid live cumulative that
+        stitches prior-days' internal accounting onto today's
+        broker-sourced realized (see FRD §11.4) so the two KPIs reconcile
+        on a day with no prior sessions."""
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT COALESCE(SUM(c.cycle_pnl), 0)
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ?
+                 AND c.ended_at IS NOT NULL
+                 AND s.session_date < ?""",
+            (mode_label, session_date_iso),
+        ) as cur:
+            row = await cur.fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
     async def fetch_closed_trades_all_sessions(self, mode_label: str) -> list[dict[str, Any]]:
         """Closed cycles across every session for a mode, newest first."""
         assert self._conn

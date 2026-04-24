@@ -643,6 +643,14 @@ or `unavailable` (when Dhan credentials are absent).
   the two reveals slippage between recorded bar-close fills and actual
   broker fills, or manual trades on the same underlying that bypassed
   the app.
+- **Cumulative P&L is a hybrid: prior days (internal) + today
+  (broker-sourced for live).** The `cumulative_pnl_refresher` pulls
+  `SUM(cycles.cycle_pnl)` for sessions *before* today and the
+  `_tree_snapshot` aggregate adds today's per-engine `realized_pnl` on
+  top — so on a day with no prior sessions "Cumulative P&L" equals
+  "Today Realized P&L" exactly (no brokerage/slippage wedge between
+  the two KPIs). Historical days keep their internal accounting
+  because Dhan's `/positions` realized figure is a today-only snapshot.
 
 ### 11.5 Security (Live Mode)
 - Dhan credentials never stored in plain text in the repo. Loaded from `.env` (gitignored) or OS keyring.
