@@ -359,35 +359,59 @@ class Database:
         return [dict(zip(cols, r)) for r in rows]
 
     async def fetch_open_cycles_with_legs(
-        self, mode_label: str, underlying: str, today_date: str
+        self, mode_label: str, underlying: str, today_date: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Cycles for this (mode, underlying, date) that the engine never
+        """Cycles for this (mode, underlying) that the engine never
         closed — typically because a prior process died or was restarted
-        while a live position was still open.
+        (including shut down overnight) while a live position was still
+        open at Dhan.
+
+        If ``today_date`` is None, returns every open cycle regardless
+        of session_date — needed so a crash at 15:15 that left a SELL
+        awaiting fill still gets adopted on the NEXT trading day's
+        startup. When a date string is passed, scopes to that day only
+        (legacy behaviour; kept for tests).
 
         Returned shape:
             [{cycle_row_id, cycle_no, underlying, atm_at_start, started_at,
               legs: [{leg_row_id, slot, kind, option_type, underlying,
                       strike, expiry, security_id, trading_symbol, lot_size,
                       lots, quantity, status, entry_price, sl_price,
-                      entry_order_id}, ...]}, ...]
+                      entry_order_id, exit_price, exit_reason,
+                      exit_order_id}, ...]}, ...]
 
         The engine calls this on startup (alongside KPI backfill) so it
         can adopt positions the previous run left open — the reconciler
-        then bridges them from PENDING → ACTIVE once Dhan confirms fills.
-        See FRD §8.2 (restart-safe adoption).
+        then bridges them from PENDING → ACTIVE once Dhan confirms fills,
+        and EXITING → STOPPED once Dhan confirms the SELL filled. See
+        FRD §8.2 (restart-safe adoption).
         """
         assert self._conn
-        async with self._conn.execute(
-            """SELECT c.id, c.cycle_no, c.underlying, c.atm_at_start, c.started_at
-               FROM cycles c
-               JOIN sessions s ON s.id = c.session_id
-               WHERE s.mode = ? AND c.underlying = ? AND s.session_date = ?
-                     AND c.ended_at IS NULL
-               ORDER BY c.id ASC""",
-            (mode_label, underlying, today_date),
-        ) as cur:
-            cycle_rows = await cur.fetchall()
+        if today_date is None:
+            async with self._conn.execute(
+                """SELECT c.id, c.cycle_no, c.underlying, c.atm_at_start,
+                          c.started_at
+                   FROM cycles c
+                   JOIN sessions s ON s.id = c.session_id
+                   WHERE s.mode = ? AND c.underlying = ?
+                         AND c.ended_at IS NULL
+                   ORDER BY c.id ASC""",
+                (mode_label, underlying),
+            ) as cur:
+                cycle_rows = await cur.fetchall()
+        else:
+            async with self._conn.execute(
+                """SELECT c.id, c.cycle_no, c.underlying, c.atm_at_start,
+                          c.started_at
+                   FROM cycles c
+                   JOIN sessions s ON s.id = c.session_id
+                   WHERE s.mode = ? AND c.underlying = ?
+                         AND s.session_date = ?
+                         AND c.ended_at IS NULL
+                   ORDER BY c.id ASC""",
+                (mode_label, underlying, today_date),
+            ) as cur:
+                cycle_rows = await cur.fetchall()
 
         out: list[dict[str, Any]] = []
         for cycle_row_id, cycle_no, und, atm, started_at in cycle_rows:

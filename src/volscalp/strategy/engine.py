@@ -174,22 +174,28 @@ class StrategyEngine:
 
     async def _restore_open_cycles_from_db(self) -> None:
         """Adopt any cycle left open by a previous process run for this
-        (mode, underlying) on today's date.
+        (mode, underlying) — regardless of session_date.
 
         Rebuilds ``self.current_cycle`` + ``self.current_cycle_row_id``
         from the DB so the strategy can continue managing positions that
-        a prior process left hanging (e.g. crash, ctrl-C while a cycle
-        was live). The reconciler is what eventually transitions each
-        leg from PENDING → ACTIVE once Dhan confirms the fill. See
-        FRD §8.2.
+        a prior process left hanging (crash, ctrl-C, or a shutdown at
+        15:15 that left a SELL awaiting Dhan's async fill ack). The
+        reconciler is what eventually transitions each leg from
+        PENDING → ACTIVE (on_fill_ack) and EXITING → STOPPED
+        (on_exit_ack). See FRD §8.2.
+
+        Searching across all dates (not just today) is critical: a
+        process killed overnight with an unfinalised SELL leaves a
+        cycle open on disk with yesterday's session_date. A today-only
+        filter would orphan that position permanently; the widened
+        filter lets the reconciler square off with Dhan on boot.
 
         A cycle only survives here if the DB has it marked open
         (``ended_at IS NULL``); closed cycles are never replayed.
         """
-        today_iso = datetime.now(self.tz).date().isoformat()
         try:
             open_cycles = await self.db.fetch_open_cycles_with_legs(
-                self.mode.value, self.underlying.value, today_iso,
+                self.mode.value, self.underlying.value, today_date=None,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("open_cycle_restore_failed", tag=self.tag, error=str(exc))
@@ -341,6 +347,12 @@ class StrategyEngine:
                     cycle.state = CycleState.ACTIVE
             elif status == LegStatus.PENDING:
                 any_pending = True
+            elif status == LegStatus.EXITING:
+                # Cycle must be in EXITING state while waiting for the
+                # reconciler to finalise — otherwise the cycle-close
+                # detector would bounce it around unpredictably and
+                # `_maybe_finalize_cycle` wouldn't know to re-evaluate.
+                cycle.state = CycleState.EXITING
 
         if restored_legs == 0:
             # No manageable legs — close the empty shell so the engine
@@ -410,8 +422,22 @@ class StrategyEngine:
         before_start = now_local < self.cfg.session.start
 
         if after_close and self.current_cycle and self.current_cycle.any_leg_open():
+            # _force_close_all kicks off SELLs for ACTIVE legs and is
+            # idempotent on re-entry — EXITING legs are skipped (handled
+            # asynchronously by the reconciler) and `_maybe_finalize_cycle`
+            # only closes the cycle when every leg is terminal.
             await self._force_close_all(ExitReason.SESSION_CLOSE)
-            return
+
+        # Drop the cycle pointer once it's truly closed. Needs to run
+        # even on ticks where `_force_close_all` wasn't called this tick
+        # (because the reconciler's on_exit_ack is what finalised the
+        # last EXITING leg in between ticks).
+        if (
+            after_close
+            and self.current_cycle
+            and self.current_cycle.state == CycleState.CLOSED
+        ):
+            self.current_cycle = None
 
         if after_close:
             return  # session done
@@ -859,6 +885,12 @@ class StrategyEngine:
                  "exit_price": leg.exit_price, "reason": reason.value,
                  "pnl": leg.realized_pnl},
             )
+            # If this was the last open leg, close the cycle now — both
+            # the synchronous path and the reconciler's async on_exit_ack
+            # funnel through here. Without this hook, a cycle whose legs
+            # all finished via async fills would stay open on disk
+            # forever.
+            await self._maybe_finalize_cycle(self.current_cycle)
 
     # ---- reconciler bridge (live fills) ------------------------------------
 
@@ -1016,6 +1048,8 @@ class StrategyEngine:
                  "pnl": leg.realized_pnl},
             )
             closed = True
+        if closed:
+            await self._maybe_finalize_cycle(cycle)
         return closed
 
     async def _maybe_schedule_lazy_leg(self, stopped: Leg, bar: Bar) -> None:
@@ -1156,26 +1190,85 @@ class StrategyEngine:
             await self._force_close_all(decision.reason or ExitReason.MTM_TARGET)
 
     async def _force_close_all(self, reason: ExitReason) -> None:
+        """Kick off exits for every ACTIVE leg in the current cycle.
+
+        CRITICAL (FRD §5.3 / §5.4): This method does **not** close the
+        cycle row in SQLite by itself. In live mode the SELL ack is
+        async — `_exit_leg` flips the leg to EXITING and the reconciler
+        finalises it via `on_exit_ack` moments later. If we closed the
+        cycle (`update_cycle_close` / `ended_at=now`) the instant we
+        *sent* the SELL, a subsequent process restart would filter the
+        cycle out of `fetch_open_cycles_with_legs` (ended_at IS NULL)
+        and orphan the pending position at Dhan. Instead we stash the
+        intended reason on the cycle, flip state to EXITING, and let
+        `_maybe_finalize_cycle` write the close row **only when every
+        leg is truly terminal** — synchronously here for paper, later
+        via the reconciler for live.
+        """
         cycle = self.current_cycle
         if not cycle:
             return
         cycle.state = CycleState.EXITING
+        # Stash the cycle-level exit reason so `_maybe_finalize_cycle`
+        # knows which label to stamp on the cycle once all legs settle.
+        cycle.exit_reason = reason
         for leg in list(cycle.legs.values()):
             if leg.status == LegStatus.ACTIVE:
                 await self._exit_leg(leg, leg.last_price or leg.entry_price, reason)
+        # Synchronous path (paper, or a live SELL that came back FILLED
+        # in-band): every leg is already STOPPED, finalise now.
+        # Async path (live SELL still awaiting fill): no-op here; the
+        # reconciler's on_exit_ack will trigger the finalise.
+        await self._maybe_finalize_cycle(cycle)
 
+    async def _maybe_finalize_cycle(self, cycle) -> None:
+        """Close the cycle (state + DB + counters + broadcast) iff every
+        leg has reached a terminal status (STOPPED / EMPTY).
+
+        Called from:
+          * end of `_force_close_all` (covers sync paper, in-band FILLED)
+          * `_finalize_leg_exit` (every SELL that finalises — including
+            the reconciler's on_exit_ack path)
+          * `on_external_close` (broker-initiated close)
+
+        Idempotent: a cycle already in CLOSED state returns immediately.
+        """
+        if cycle is None:
+            return
+        if cycle.state == CycleState.CLOSED:
+            return
+        # If any leg is still in-flight (WATCHING / PENDING / ACTIVE /
+        # EXITING) we cannot close the cycle yet — doing so would mark
+        # it ended on disk while a real Dhan position is still open.
+        for leg in cycle.legs.values():
+            if leg.status not in (LegStatus.STOPPED, LegStatus.EMPTY):
+                if cycle.state != CycleState.EXITING:
+                    cycle.state = CycleState.EXITING
+                return
+        # Every leg is terminal — safe to finalise.
         cycle.cycle_pnl = sum(leg.realized_pnl for leg in cycle.legs.values())
         cycle.state = CycleState.CLOSED
+        reason = (
+            cycle.exit_reason
+            or self._last_leg_exit_reason(cycle)
+            or ExitReason.LEG_SL
+        )
         cycle.exit_reason = reason
         cycle.exit_ts = now_ns()
         if self.current_cycle_row_id is not None:
-            await self.db.update_cycle_close(
-                self.current_cycle_row_id,
-                reason,
-                cycle.cycle_pnl,
-                cycle.peak_mtm,
-                cycle.trough_mtm,
-            )
+            try:
+                await self.db.update_cycle_close(
+                    self.current_cycle_row_id,
+                    reason,
+                    cycle.cycle_pnl,
+                    cycle.peak_mtm,
+                    cycle.trough_mtm,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "cycle_close_db_update_failed",
+                    tag=self.tag, cycle=cycle.cycle_id, error=str(exc),
+                )
         self.closed_cycles_count += 1
         if cycle.cycle_pnl > 0:
             self.win_count += 1

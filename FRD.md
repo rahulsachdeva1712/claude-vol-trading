@@ -293,6 +293,36 @@ models, the paper/live engine, and both backtest scripts.
 - No new cycle may be initiated after 15:15.
 - Partial cycles (legs entered but no exit triggered) are closed at session end.
 
+**Session-close is async-fill aware.** The 15:15 force-close routes
+through the same `_exit_leg` → EXITING → `on_exit_ack` pipeline as any
+other exit (§5.4). Critically, the cycle row in SQLite is NOT marked
+closed the instant the SELL is *sent* — it is marked closed only when
+`_maybe_finalize_cycle` observes every leg in a terminal state
+(`STOPPED` / `EMPTY`). This prevents the following orphan:
+
+> App places SELL at 15:15. Dhan returns `PENDING`. App marks cycle
+> CLOSED in DB with `ended_at=now`. User shuts down at 15:20 before
+> Dhan fills. Dhan eventually fills at 15:16:31 (or rejects). Next
+> morning: app restart filters out the cycle by `ended_at IS NULL`,
+> never adopts it → position sits orphaned at Dhan.
+
+The fix: `_force_close_all` stashes the cycle-level reason
+(`SESSION_CLOSE`, `MTM_TARGET`, etc.) on the cycle and flips cycle
+state to EXITING. Every leg finalisation (sync or async) calls
+`_maybe_finalize_cycle`, which writes `update_cycle_close` only when
+all legs are truly terminal. On restart, the widened
+`fetch_open_cycles_with_legs` (any session_date, ended_at IS NULL)
+adopts yesterday's unfinalised cycle and the reconciler resumes
+the bridge. See §8.2.
+
+Corollary: a PENDING leg at 15:15 (BUY still awaiting Dhan's fill
+ack) can't be SELL'd yet — there's no long position. The reconciler
+is still polling; the moment it promotes PENDING → ACTIVE via
+`on_fill_ack`, the next engine tick re-enters the session-close
+branch, sees an ACTIVE leg, and fires the SELL. `any_leg_open()` is
+the gate — it treats PENDING/ACTIVE/EXITING as "still open", so the
+tick loop keeps retrying until every leg is STOPPED.
+
 ### 5.4 Exit Priority Order
 When multiple exit conditions could apply simultaneously, priority is:
 1. Kill switch (live only — disarms + flattens all live cycles)
@@ -521,8 +551,13 @@ model into the engines' leg state machines:
 backfill (`_backfill_counters_from_db`), each live engine runs
 `_restore_open_cycles_from_db`:
 
-- Queries `cycles` + `legs` for today's session-date, this engine's
-  `(mode, underlying)`, with `ended_at IS NULL`.
+- Queries `cycles` + `legs` for this engine's `(mode, underlying)`
+  with `ended_at IS NULL` — **across all session dates**, not just
+  today. A process shut down at 15:20 with a SELL still awaiting
+  Dhan's fill ack leaves a cycle open on disk dated *yesterday*; a
+  today-only filter would orphan that position permanently. The
+  widened filter lets the reconciler square off on the next boot
+  regardless of the gap.
 - Rebuilds in-memory `Cycle` + `Leg` objects, carrying each leg's
   persisted `status`, `security_id`, `entry_price`, `sl_price`, and
   `row_id`. Terminal legs (STOPPED / EMPTY) are skipped — they already
@@ -555,6 +590,19 @@ This adoption path is what makes the fill-ack bridge robust across
 process restarts: a crash mid-cycle doesn't orphan positions, and the
 user doesn't need to re-arm to continue managing them (the armed
 check only gates *new* cycle starts — see `_tick_engine`).
+
+**Cycle-close atomicity (`_maybe_finalize_cycle`).** The cycle row in
+SQLite is closed (`update_cycle_close`, counters incremented,
+broadcast fired) **only** when every leg reaches a terminal status
+(`STOPPED` / `EMPTY`). `_force_close_all` no longer closes the cycle
+optimistically — it flips cycle state to `EXITING`, stashes the
+cycle-level `exit_reason`, and kicks off SELLs. Every leg finaliser
+(`_finalize_leg_exit`, `on_external_close`, `on_exit_ack` via
+`_finalize_leg_exit`) calls `_maybe_finalize_cycle` on its way out,
+which finalises the cycle IFF no leg is still in-flight. This closes
+the last orphan class at session end: a 15:15 SELL that Dhan acks as
+`PENDING` can no longer leave a cycle marked closed-on-disk while a
+long position is still open at the broker.
 
 > Backtesting on historical data is explicitly out of scope (see §1.2).
 
