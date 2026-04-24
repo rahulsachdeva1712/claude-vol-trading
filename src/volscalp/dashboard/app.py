@@ -37,6 +37,21 @@ def create_app(state) -> FastAPI:
     """`state` is a RuntimeState object (see main.py)."""
     app = FastAPI(title="volscalp dashboard")
 
+    # Dev tool on 127.0.0.1 only (see FRD §11.1/§12.3). Tell the browser
+    # never to cache our static bundle or index page — otherwise a code
+    # deploy leaves the old app.js in place and the new endpoints look
+    # broken until the user hard-refreshes. The perf hit is trivial on
+    # localhost.
+    @app.middleware("http")
+    async def _no_cache_static(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
+
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
