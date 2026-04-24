@@ -394,7 +394,8 @@ class Database:
             async with self._conn.execute(
                 """SELECT id, slot, kind, option_type, underlying, strike, expiry,
                           security_id, trading_symbol, lot_size, lots, quantity,
-                          status, entry_price, sl_price, entry_order_id
+                          status, entry_price, sl_price, entry_order_id,
+                          exit_price, exit_reason, exit_order_id
                    FROM legs
                    WHERE cycle_id = ?
                    ORDER BY slot ASC""",
@@ -404,7 +405,7 @@ class Database:
             legs = []
             for (lid, slot, kind, opt, lund, strike, expiry, sec_id, tsym,
                  lot_size, lots, qty, status, entry_price, sl_price,
-                 entry_oid) in leg_rows:
+                 entry_oid, exit_price, exit_reason, exit_oid) in leg_rows:
                 legs.append({
                     "leg_row_id": lid,
                     "slot": int(slot),
@@ -422,6 +423,12 @@ class Database:
                     "entry_price": float(entry_price) if entry_price is not None else 0.0,
                     "sl_price": float(sl_price) if sl_price is not None else 0.0,
                     "entry_order_id": entry_oid or "",
+                    # Needed to rehydrate a leg left in EXITING — the
+                    # reconciler finalises it via on_exit_ack using the
+                    # persisted exit_reason + provisional exit_price.
+                    "exit_price": float(exit_price) if exit_price is not None else 0.0,
+                    "exit_reason": exit_reason,
+                    "exit_order_id": exit_oid or "",
                 })
             out.append({
                 "cycle_row_id": int(cycle_row_id),

@@ -311,6 +311,34 @@ When multiple exit conditions could apply simultaneously, priority is:
    price the broker filled at (`sellAvg` from `/positions`, falling back
    to last LTP when Dhan hasn't refreshed the row yet).
 
+**Exit lifecycle in live mode (async-fill aware).** Triggers 3–5 above
+don't transition the leg straight to `STOPPED`; they route through
+`_exit_leg`, which:
+
+1. Stashes the planned `exit_reason` and a provisional `exit_price`
+   (LTP or the triggering bar's close) on the leg, flips it to
+   `LegStatus.EXITING`, and persists that state to SQLite **before**
+   calling Dhan. A crash in the next few ms is recoverable — on
+   restart the leg loads as EXITING and the reconciler finalizes it.
+2. Places the SELL on Dhan.
+   - `FILLED` in-band → immediately call `_finalize_leg_exit` (STOPPED,
+     accumulate `realized_pnl`, persist exit row, broadcast).
+   - `PENDING` / `OPEN` / `TRANSIT` → leg stays EXITING; the reconciler
+     calls `on_exit_ack(sid, sellAvg)` once `/positions` shows the
+     position is closed, preserving the **original** exit reason (vs
+     `on_external_close`, which stamps `EXTERNAL_CLOSE`).
+   - `REJECTED` / `FAILED` / `CANCELLED` → **rollback to ACTIVE** (clear
+     `exit_reason` / `exit_order_id` / `exit_price`, persist) so the
+     strategy retries on the next eligible tick. Without this rollback
+     a rejected SELL would wedge the leg in EXITING forever while the
+     real Dhan position continued unmanaged.
+
+Paper mode is synchronous — `PaperBackend` returns `FILLED` at LTP — so
+the EXITING state is transient (microseconds) and `_finalize_leg_exit`
+runs immediately in the same call. The fallback for a paper SELL that
+returns non-FILLED (LTP missing) finalizes at the provisional price
+rather than wedging the cycle.
+
 Priority here is evaluation-cadence-aware: an intrabar target hit at
 09:40:37 fires immediately, even though MAX_LOSS for the same minute
 wouldn't have been evaluated until the 09:41 bar close. This is
@@ -453,14 +481,29 @@ model into the engines' leg state machines:
   `engine.on_fill_ack(security_id, buyAvg, filled_qty)`. The engine
   promotes the leg to ACTIVE, recomputes SL from the real fill price,
   and persists the new entry row to SQLite.
-- **EXTERNAL_CLOSE detection.** An ACTIVE leg whose `securityId` is
-  absent from the next poll (or whose row shows `netQty==0` with
-  `sellQty>0`) is treated as closed out-of-band — the reconciler calls
-  `engine.on_external_close(security_id, sellAvg)` and the leg is
-  stamped STOPPED with reason `EXTERNAL_CLOSE` (§5.4). The cycle-done
-  detector (§6.1) then decides whether the cycle itself is over.
+- **EXITING → STOPPED (exit fill-ack bridge).** An EXITING leg — one
+  the engine has placed a SELL for but Dhan hasn't yet confirmed (see
+  §5.4) — whose `securityId` is absent from the next poll (or whose
+  row shows `netQty==0` with `sellQty>0`) triggers
+  `engine.on_exit_ack(security_id, sellAvg)`. The engine finalizes the
+  exit using the leg's **stashed** `exit_reason` (so `LEG_SL`,
+  `MTM_TARGET`, etc. are preserved) — this is the distinguishing
+  behaviour vs `on_external_close`, which always stamps
+  `EXTERNAL_CLOSE`. Without this bridge, a SELL that Dhan accepted as
+  PENDING but hadn't filled yet would cause the app to mark the leg
+  STOPPED optimistically the instant `orders.place()` returned; if
+  Dhan ultimately rejected or only partial-filled, the real position
+  would orphan — live at the broker, invisible to the app.
+- **EXTERNAL_CLOSE detection.** An ACTIVE (not EXITING) leg whose
+  `securityId` is absent from the next poll (or whose row shows
+  `netQty==0` with `sellQty>0`) is treated as closed out-of-band — the
+  reconciler calls `engine.on_external_close(security_id, sellAvg)`
+  and the leg is stamped STOPPED with reason `EXTERNAL_CLOSE` (§5.4).
+  The cycle-done detector (§6.1) then decides whether the cycle
+  itself is over.
 - Paper engines are invisible to the reconciler — `PaperBackend`
-  returns FILLED synchronously, so paper legs never sit in PENDING.
+  returns FILLED synchronously, so paper legs never sit in PENDING
+  or EXITING at runtime.
 - **Broker-truth realized P&L.** Every poll the reconciler also sums
   ``realizedProfit`` across Dhan's option positions for each live
   engine's underlying (`tradingSymbol` prefix match — NIFTY vs
@@ -491,14 +534,22 @@ backfill (`_backfill_counters_from_db`), each live engine runs
   usual: PENDING legs get promoted once the fill acks land; ACTIVE
   legs get EXTERNAL_CLOSE if the position is gone.
 - **Paper-mode restore special case.** Paper engines have no
-  reconciler to bridge PENDING → ACTIVE. A PENDING leg on disk means
-  the prior process crashed between `insert_leg` (status=PENDING,
-  provisional entry) and `update_leg_entry` (status=ACTIVE after the
-  synchronous `PaperBackend` fill), so on restore paper PENDING legs
-  are promoted to ACTIVE in-memory AND in SQLite using the stored
-  entry price — otherwise they would wedge forever (entry never
-  confirms, SL never evaluates, cycle MTM stays 0). Logged as
-  `paper_pending_leg_promoted_on_restore`.
+  reconciler to bridge PENDING → ACTIVE or EXITING → STOPPED. A
+  PENDING leg on disk means the prior process crashed between
+  `insert_leg` (status=PENDING, provisional entry) and
+  `update_leg_entry` (status=ACTIVE after the synchronous
+  `PaperBackend` fill), so on restore paper PENDING legs are promoted
+  to ACTIVE in-memory AND in SQLite using the stored entry price —
+  otherwise they would wedge forever (entry never confirms, SL never
+  evaluates, cycle MTM stays 0). Logged as
+  `paper_pending_leg_promoted_on_restore`. Symmetrically, an EXITING
+  paper leg on disk means the crash happened between
+  `update_leg_exit(EXITING)` and the immediate `_finalize_leg_exit`;
+  on restore, paper EXITING legs are auto-finalized to STOPPED using
+  the stashed `exit_reason` (or `MANUAL` as a neutral fallback) and
+  the stored provisional `exit_price` (or `entry_price` if the
+  provisional is 0). Logged as
+  `paper_exiting_leg_finalized_on_restore`.
 
 This adoption path is what makes the fill-ack bridge robust across
 process restarts: a crash mid-cycle doesn't orphan positions, and the

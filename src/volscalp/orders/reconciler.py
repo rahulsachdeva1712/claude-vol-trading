@@ -264,3 +264,51 @@ class PositionReconciler:
                                 tag=engine.tag, slot=leg.slot,
                                 error=str(exc),
                             )
+                    continue
+
+                # Case 3: EXITING leg → planned exit awaiting fill ack.
+                # Same "position gone" detection as external close, but
+                # finalized via on_exit_ack so the engine preserves the
+                # ORIGINAL exit_reason (LEG_SL, MTM_TARGET, etc.) rather
+                # than stamping it EXTERNAL_CLOSE. Until Dhan confirms
+                # the SELL filled, the leg stays EXITING and the
+                # position remains on the books — that's the whole
+                # point of this bridge: no "closed in app, open at
+                # broker" orphans.
+                if leg.status == LegStatus.EXITING:
+                    if row is None:
+                        try:
+                            await engine.on_exit_ack(
+                                int(leg.security_id),
+                                float(
+                                    leg.exit_price
+                                    or leg.last_price
+                                    or leg.entry_price
+                                ),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning(
+                                "exit_ack_failed",
+                                tag=engine.tag, slot=leg.slot,
+                                error=str(exc),
+                            )
+                        continue
+                    if row["netQty"] == 0 and row["sellQty"] > 0:
+                        exit_price = (
+                            row["sellAvg"] if row["sellAvg"] > 0
+                            else (
+                                leg.exit_price
+                                or leg.last_price
+                                or leg.entry_price
+                            )
+                        )
+                        try:
+                            await engine.on_exit_ack(
+                                int(leg.security_id), float(exit_price),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning(
+                                "exit_ack_failed",
+                                tag=engine.tag, slot=leg.slot,
+                                error=str(exc),
+                            )

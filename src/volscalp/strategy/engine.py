@@ -240,6 +240,15 @@ class StrategyEngine:
                 kind = LegKind(raw["kind"])
             except ValueError:
                 continue
+            # Rehydrate exit_reason for EXITING legs so the reconciler's
+            # on_exit_ack preserves the original trigger (LEG_SL, etc.).
+            raw_exit_reason = raw.get("exit_reason")
+            try:
+                exit_reason_enum = (
+                    ExitReason(raw_exit_reason) if raw_exit_reason else None
+                )
+            except ValueError:
+                exit_reason_enum = None
             leg = Leg(
                 slot=int(raw["slot"]),
                 kind=kind,
@@ -256,6 +265,9 @@ class StrategyEngine:
                 sl_price=float(raw["sl_price"]),
                 last_price=float(raw["entry_price"]),
                 entry_order_id=raw["entry_order_id"],
+                exit_price=float(raw.get("exit_price", 0.0) or 0.0),
+                exit_reason=exit_reason_enum,
+                exit_order_id=raw.get("exit_order_id", "") or "",
                 row_id=int(raw["leg_row_id"]),
             )
             # Paper has no async fill bridge — a PENDING leg on disk is
@@ -288,6 +300,39 @@ class StrategyEngine:
                     security_id=leg.security_id,
                     entry_price=leg.entry_price,
                 )
+            # Paper EXITING → STOPPED on restore: same reasoning as
+            # PENDING → ACTIVE above — PaperBackend is synchronous, so a
+            # leg left in EXITING means the process died after persist
+            # but before _finalize_leg_exit. Finalize it now using the
+            # provisional exit_price we stashed pre-place. Skipping this
+            # would wedge the paper cycle forever (no reconciler exists
+            # to bridge it).
+            if self.mode == Mode.PAPER and status == LegStatus.EXITING:
+                leg.status = LegStatus.STOPPED
+                status = LegStatus.STOPPED
+                if leg.exit_price <= 0:
+                    leg.exit_price = leg.entry_price  # neutral fallback
+                if leg.exit_reason is None:
+                    leg.exit_reason = ExitReason.MANUAL
+                self.realized_pnl += leg.realized_pnl
+                try:
+                    await self.db.update_leg_exit(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "paper_exiting_leg_persist_failed",
+                        tag=self.tag, slot=leg.slot, error=str(exc),
+                    )
+                log.warning(
+                    "paper_exiting_leg_finalized_on_restore",
+                    tag=self.tag, slot=leg.slot,
+                    security_id=leg.security_id,
+                    exit_price=leg.exit_price,
+                    exit_reason=leg.exit_reason.value,
+                )
+                # Skip the "alive" classification below.
+                cycle.legs[leg.slot] = leg
+                restored_legs += 1
+                continue
             cycle.legs[leg.slot] = leg
             restored_legs += 1
             if status == LegStatus.ACTIVE:
@@ -672,6 +717,31 @@ class StrategyEngine:
         )
 
     async def _exit_leg(self, leg: Leg, price: float, reason: ExitReason) -> None:
+        """Place the SELL and, for live mode, wait for Dhan to confirm.
+
+        Live flow (async):
+          * Stash the planned ``exit_reason`` + provisional ``exit_price``
+            on the leg and persist ``EXITING`` to SQLite BEFORE placing
+            the order — so a crash in the next few ms is recoverable
+            (on restart the leg loads as EXITING and the reconciler will
+            finalize it via ``on_exit_ack``).
+          * Place the SELL.
+          * If Dhan returns FILLED in-band → finalize immediately.
+          * If PENDING / OPEN / TRANSIT → leave at EXITING; the
+            reconciler will call ``on_exit_ack`` when /positions shows
+            the position is closed.
+          * If REJECTED / FAILED / CANCELLED → revert to ACTIVE so the
+            strategy retries on the next eligible tick. Without this
+            rollback, a rejected SELL would wedge the leg forever in
+            EXITING and the real Dhan position would go unmanaged —
+            exactly the orphan class we fixed by introducing this path.
+
+        Paper flow (synchronous): ``PaperBackend`` returns FILLED at LTP
+        so we go straight to finalize. The defensive fallback covers the
+        rare case where LTP is 0 at the moment of SELL (paper would have
+        returned PENDING) — use the provisional price so the cycle
+        doesn't wedge.
+        """
         inst = self.instruments.get_by_id(leg.security_id)
         if not inst:
             log.warning("exit_leg_missing_instrument", slot=leg.slot)
@@ -687,10 +757,74 @@ class StrategyEngine:
             quantity=leg.quantity,
         )
         leg.exit_order_id = coid
+        leg.exit_reason = reason       # stash for async finalizer
+        leg.exit_price = price         # provisional; replaced by real fill
         leg.status = LegStatus.EXITING
 
+        # Persist EXITING intent so restart recovery knows this was a
+        # planned exit (not an external close).
+        if leg.row_id:
+            try:
+                await self.db.update_leg_exit(leg.row_id, leg)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "leg_exiting_db_update_failed",
+                    slot=leg.slot, error=str(exc),
+                )
+
         report = await self.orders.place(req)
-        fill_price = report.avg_fill_price if report.avg_fill_price > 0 else price
+
+        if report.status == "FILLED":
+            fill_price = report.avg_fill_price if report.avg_fill_price > 0 else price
+            await self._finalize_leg_exit(leg, fill_price, reason)
+            return
+
+        if report.status in ("PENDING", "OPEN", "TRANSIT"):
+            if self.mode != Mode.LIVE:
+                # Paper is synchronous — a non-FILLED here means LTP was
+                # missing. Fall back to the provisional price rather
+                # than leaving the cycle wedged.
+                log.warning(
+                    "paper_exit_not_filled_fallback",
+                    tag=self.tag, slot=leg.slot,
+                )
+                await self._finalize_leg_exit(leg, price, reason)
+                return
+            log.info(
+                "leg_exit_pending_fill_ack",
+                tag=self.tag, slot=leg.slot,
+                broker_order_id=report.broker_order_id,
+                provisional_exit=leg.exit_price, reason=reason.value,
+            )
+            return
+
+        if report.status in ("REJECTED", "FAILED", "CANCELLED"):
+            # Roll back so the strategy retries on next tick.
+            leg.status = LegStatus.ACTIVE
+            leg.exit_reason = None
+            leg.exit_order_id = None
+            leg.exit_price = 0.0
+            if leg.row_id:
+                try:
+                    await self.db.update_leg_entry(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "leg_exit_rollback_failed",
+                        slot=leg.slot, error=str(exc),
+                    )
+            log.warning(
+                "leg_exit_rejected",
+                tag=self.tag, slot=leg.slot, reason=report.message,
+            )
+
+    async def _finalize_leg_exit(
+        self, leg: Leg, fill_price: float, reason: ExitReason,
+    ) -> None:
+        """Complete an exit once the SELL is confirmed filled.
+
+        Used for both synchronous fills (paper, or the rare live FILLED
+        response) and async fills funneled via ``on_exit_ack``.
+        """
         leg.exit_price = fill_price
         leg.status = LegStatus.STOPPED
         leg.exit_reason = reason
@@ -701,7 +835,10 @@ class StrategyEngine:
             try:
                 await self.db.update_leg_exit(leg.row_id, leg)
             except Exception as exc:  # noqa: BLE001
-                log.warning("leg_exit_db_update_failed", slot=leg.slot, error=str(exc))
+                log.warning(
+                    "leg_exit_db_update_failed",
+                    slot=leg.slot, error=str(exc),
+                )
 
         log.info(
             "leg_exit",
@@ -713,13 +850,15 @@ class StrategyEngine:
             price=fill_price,
             pnl=leg.realized_pnl,
         )
-        await self.bus.broadcast(
-            "leg_update",
-            {"mode": self.mode.value, "underlying": self.underlying.value,
-             "cycle": self.current_cycle.cycle_id if self.current_cycle else None,
-             "slot": leg.slot, "status": leg.status.value,
-             "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
-        )
+        if self.current_cycle:
+            await self.bus.broadcast(
+                "leg_update",
+                {"mode": self.mode.value, "underlying": self.underlying.value,
+                 "cycle": self.current_cycle.cycle_id, "slot": leg.slot,
+                 "status": leg.status.value,
+                 "exit_price": leg.exit_price, "reason": reason.value,
+                 "pnl": leg.realized_pnl},
+            )
 
     # ---- reconciler bridge (live fills) ------------------------------------
 
@@ -788,6 +927,40 @@ class StrategyEngine:
             )
             promoted = True
         return promoted
+
+    async def on_exit_ack(
+        self, security_id: int, exit_price: float,
+    ) -> bool:
+        """Called by ``PositionReconciler`` when an EXITING leg's Dhan
+        position has closed (netQty==0 with sellQty>0, or the row
+        reaped).
+
+        Finalizes the planned exit using the stashed ``exit_reason`` on
+        the leg — distinct from ``on_external_close`` which fires only
+        for ACTIVE legs (user-initiated square-off from the Dhan
+        portal, broker-initiated stop, etc.). Without this hook the
+        app would mark the leg STOPPED the instant the SELL was *sent*
+        rather than when it *filled*, and any rejected/partial SELL
+        would leave a ghost position at Dhan that the app thinks is
+        closed. See FRD §5.4 / §8.2.
+        """
+        if self.mode != Mode.LIVE:
+            return False
+        cycle = self.current_cycle
+        if not cycle:
+            return False
+        for leg in list(cycle.legs.values()):
+            if leg.security_id != security_id:
+                continue
+            if leg.status != LegStatus.EXITING:
+                continue
+            price = float(exit_price) if exit_price > 0 else (
+                leg.exit_price or leg.last_price or leg.entry_price
+            )
+            reason = leg.exit_reason or ExitReason.MANUAL
+            await self._finalize_leg_exit(leg, price, reason)
+            return True
+        return False
 
     async def on_external_close(
         self, security_id: int, exit_price: float,
