@@ -385,6 +385,107 @@ class CycleResult:
     peak_mtm: float
     trough_mtm: float
     legs_entered: int
+    # Session-level risk telemetry — populated after the cycle closes.
+    # session_pnl_at_close = cumulative P&L across all cycles in this
+    # (index, session) up to and including this one. session_peak_at_close
+    # = max of that running sum seen so far today. session_halted_after
+    # is True if this cycle triggered (or ran after) the session halt.
+    session_pnl_at_close: float = 0.0
+    session_peak_at_close: float = 0.0
+    session_halted_after: bool = False
+
+
+@dataclass(slots=True)
+class SessionRiskGate:
+    """Per-(index, session) state for the session-level lock-and-trail.
+
+    The gate is consulted at two points:
+      * Before each new cycle opens: if ``halted`` is True, the cycle is
+        not opened at all.
+      * Inside the cycle loop (hard mode only) on each bar close: if the
+        gate transitions to halted mid-cycle, the cycle force-closes at
+        that bar's close with exit_reason = ``SESSION_LOCK_TRAIL`` or
+        ``SESSION_LOSS_LIMIT`` depending on which rule fired.
+
+    Disabled threshold semantics: any of ``lock_trigger``, ``trail_drop``,
+    ``daily_loss_limit`` can be None → that rule is off. When all three
+    are None the gate is effectively a no-op and behaviour matches the
+    pre-session-lock-trail backtest (baseline parity).
+    """
+    lock_trigger: float | None = None
+    trail_drop: float | None = None
+    daily_loss_limit: float | None = None
+    halt_mode: Literal["soft", "hard"] = "soft"
+
+    # Runtime state (reset per index per session by the orchestrator).
+    session_pnl: float = 0.0
+    session_peak: float = 0.0
+    armed: bool = False            # lock_trigger crossed → trail is live
+    halted: bool = False
+    halt_reason: str = ""          # SESSION_LOCK_TRAIL / SESSION_LOSS_LIMIT
+    halt_cycle_no: int = 0         # cycle_no that triggered the halt
+
+    def on_cycle_close(self, cycle_pnl: float, cycle_no: int) -> None:
+        """Update running session P&L / peak and evaluate halt rules.
+
+        Called after each cycle finishes. The halt flag set here blocks
+        subsequent cycles from opening (soft and hard). Hard-mode mid-
+        cycle evaluation is done via ``check_intracycle``.
+        """
+        self.session_pnl += cycle_pnl
+        if self.session_pnl > self.session_peak:
+            self.session_peak = self.session_pnl
+        # Arm the trail once we've banked enough profit.
+        if (not self.armed) and self.lock_trigger is not None \
+                and self.session_pnl >= self.lock_trigger:
+            self.armed = True
+        # Trail drop check (only active after arming).
+        if (not self.halted) and self.armed and self.trail_drop is not None:
+            if self.session_pnl <= self.session_peak - self.trail_drop:
+                self.halted = True
+                self.halt_reason = "SESSION_LOCK_TRAIL"
+                self.halt_cycle_no = cycle_no
+        # Absolute daily-loss gate — always active, no arming required.
+        if (not self.halted) and self.daily_loss_limit is not None:
+            if self.session_pnl <= -abs(self.daily_loss_limit):
+                self.halted = True
+                self.halt_reason = "SESSION_LOSS_LIMIT"
+                self.halt_cycle_no = cycle_no
+
+    def check_intracycle(self, running_cycle_mtm: float, cycle_no: int) -> str | None:
+        """Hard-mode: evaluate halt rules against ``session_pnl + running_cycle_mtm``.
+
+        Returns the halt reason (SESSION_LOCK_TRAIL / SESSION_LOSS_LIMIT)
+        if the active cycle should be force-closed at this bar, else None.
+        NOP when halt_mode != 'hard' or gate is already halted.
+        """
+        if self.halt_mode != "hard" or self.halted:
+            return None
+        proj = self.session_pnl + running_cycle_mtm
+        proj_peak = max(self.session_peak, proj)
+        # Arm inline if projection crosses trigger.
+        armed = self.armed or (
+            self.lock_trigger is not None and proj >= self.lock_trigger
+        )
+        if armed and self.trail_drop is not None:
+            if proj <= proj_peak - self.trail_drop:
+                self.halted = True
+                self.halt_reason = "SESSION_LOCK_TRAIL"
+                self.halt_cycle_no = cycle_no
+                return "SESSION_LOCK_TRAIL"
+        if self.daily_loss_limit is not None:
+            if proj <= -abs(self.daily_loss_limit):
+                self.halted = True
+                self.halt_reason = "SESSION_LOSS_LIMIT"
+                self.halt_cycle_no = cycle_no
+                return "SESSION_LOSS_LIMIT"
+        return None
+
+    @property
+    def enabled(self) -> bool:
+        return (self.lock_trigger is not None
+                or self.trail_drop is not None
+                or self.daily_loss_limit is not None)
 
 
 @dataclass(slots=True)
@@ -464,6 +565,7 @@ def simulate_session(
     underlying: str, session: date, store: CacheStore, fan: int, stats: ReplayStats,
     *, leg_sl_slip_bps: int = 0, disable_fixed_strike: bool = False,
     leg_trades_out: list[LegTrade] | None = None,
+    gate: SessionRiskGate | None = None,
 ) -> list[CycleResult]:
     spec = INDEX_SPECS[underlying]
     interval = spec["strike_interval"]
@@ -501,6 +603,12 @@ def simulate_session(
 
     # Cycles loop: open a new one whenever no cycle is active.
     while i < len(session_minutes):
+        # Session-halt gate — block new cycles once the halt fires
+        # (applies to both soft and hard modes). We still advance the
+        # loop so the outer orchestration can move on, but no more
+        # cycles are opened today for this index.
+        if gate is not None and gate.halted:
+            break
         m = session_minutes[i]
         spot = spot_by_minute.get(m, 0.0)
         if spot <= 0:
@@ -690,6 +798,16 @@ def simulate_session(
                     cycle_exit_reason = "MTM_MAX_LOSS"
                     break
 
+            # 4b) Session-level halt (hard mode only). Evaluated at bar
+            #     close on the projected session P&L (gate.session_pnl +
+            #     running cycle MTM). Soft mode halts AFTER the cycle
+            #     naturally closes, so this branch is skipped there.
+            if gate is not None and gate.halt_mode == "hard" and any_active:
+                hard_reason = gate.check_intracycle(mtm, cycle_no)
+                if hard_reason is not None:
+                    cycle_exit_reason = hard_reason
+                    break
+
             # 7) Cycle-done check — a cycle is "done" when there are no
             #    legs in ACTIVE or WATCHING state. This means:
             #      (a) both bases SL'd and no lazy was eligible, OR
@@ -773,6 +891,20 @@ def simulate_session(
         final_mtm = sum(l.realized_pnl for l in legs)
         started_dt = datetime.fromtimestamp(cycle_started_m, tz=IST)
         ended_dt = datetime.fromtimestamp(session_minutes[end_idx], tz=IST)
+
+        # Update session gate with this cycle's P&L. If hard mode already
+        # flipped the gate's halted flag inline, on_cycle_close's re-eval
+        # is idempotent — it only transitions False->True, so a no-op.
+        if gate is not None:
+            gate.on_cycle_close(final_mtm, cycle_no)
+            sess_pnl = round(gate.session_pnl, 2)
+            sess_peak = round(gate.session_peak, 2)
+            sess_halted = gate.halted
+        else:
+            sess_pnl = 0.0
+            sess_peak = 0.0
+            sess_halted = False
+
         results.append(CycleResult(
             underlying=underlying, session_date=session, cycle_no=cycle_no,
             started_at=started_dt, ended_at=ended_dt, atm_at_start=atm,
@@ -780,6 +912,9 @@ def simulate_session(
             exit_reason=cycle_exit_reason, cycle_pnl=round(final_mtm, 2),
             peak_mtm=round(peak_mtm, 2), trough_mtm=round(trough_mtm, 2),
             legs_entered=legs_entered,
+            session_pnl_at_close=sess_pnl,
+            session_peak_at_close=sess_peak,
+            session_halted_after=sess_halted,
         ))
         stats.cycles += 1
         i += 1   # next minute starts the next cycle
@@ -976,6 +1111,7 @@ def _write_csv(cycles: list[CycleResult], path: Path) -> None:
             "session_date", "underlying", "cycle_no", "started_at", "ended_at",
             "atm_at_start", "ce_strike", "pe_strike",
             "exit_reason", "legs_entered", "cycle_pnl", "peak_mtm", "trough_mtm",
+            "session_pnl_at_close", "session_peak_at_close", "session_halted_after",
         ])
         for c in cycles:
             w.writerow([
@@ -984,6 +1120,8 @@ def _write_csv(cycles: list[CycleResult], path: Path) -> None:
                 c.atm_at_start, c.ce_strike, c.pe_strike,
                 c.exit_reason, c.legs_entered,
                 f"{c.cycle_pnl:.2f}", f"{c.peak_mtm:.2f}", f"{c.trough_mtm:.2f}",
+                f"{c.session_pnl_at_close:.2f}", f"{c.session_peak_at_close:.2f}",
+                "1" if c.session_halted_after else "0",
             ])
 
 
@@ -1081,6 +1219,241 @@ def _write_trace_csv(legs: list[LegTrade], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Replay orchestration (sharable with sweep scripts)
+# ---------------------------------------------------------------------------
+
+def run_replay(
+    *,
+    sessions: list[date],
+    indices: list[str],
+    store: CacheStore,
+    fan: int,
+    leg_sl_slip_bps: int,
+    disable_fixed_strike: bool = False,
+    session_cfg: dict | None = None,
+    stats: ReplayStats | None = None,
+    trace_day: date | None = None,
+    trace_legs_out: list[LegTrade] | None = None,
+    progress_label: str = "",
+) -> list[CycleResult]:
+    """Run one full backtest pass with a given config.
+
+    Each (index, session) gets its own ``SessionRiskGate`` — session-level
+    P&L does not pool across indices. The gate is constructed from
+    ``session_cfg`` which may supply any/all of ``lock_trigger``,
+    ``trail_drop``, ``daily_loss_limit``, ``halt_mode`` (defaults: all
+    None / "soft", which reproduces pre-session-lock baseline behaviour).
+    """
+    if stats is None:
+        stats = ReplayStats()
+    cfg = session_cfg or {}
+    lock_trigger = cfg.get("lock_trigger")
+    trail_drop = cfg.get("trail_drop")
+    daily_loss_limit = cfg.get("daily_loss_limit")
+    halt_mode = cfg.get("halt_mode", "soft")
+
+    run_cycles: list[CycleResult] = []
+    for i, session in enumerate(sessions, start=1):
+        legs_sink = (
+            trace_legs_out if (trace_day is not None and session == trace_day
+                               and trace_legs_out is not None) else None
+        )
+        for underlying in indices:
+            gate = SessionRiskGate(
+                lock_trigger=lock_trigger,
+                trail_drop=trail_drop,
+                daily_loss_limit=daily_loss_limit,
+                halt_mode=halt_mode,
+            )
+            run_cycles.extend(
+                simulate_session(
+                    underlying, session, store, fan, stats,
+                    leg_sl_slip_bps=leg_sl_slip_bps,
+                    disable_fixed_strike=disable_fixed_strike,
+                    leg_trades_out=legs_sink,
+                    gate=gate,
+                )
+            )
+        if i % 50 == 0 or i == len(sessions):
+            tag = f"[{progress_label}] " if progress_label else ""
+            print(f"# progress {tag}{i}/{len(sessions)} sessions — "
+                  f"cycles so far: {len(run_cycles)}", flush=True)
+    return run_cycles
+
+
+# ---------------------------------------------------------------------------
+# Session-halt + consistency reporting
+# ---------------------------------------------------------------------------
+
+def _daily_session_pnl(cycles: list[CycleResult]) -> dict[tuple[str, date], float]:
+    """Sum of cycle_pnl per (index, session_date)."""
+    out: dict[tuple[str, date], float] = {}
+    for c in cycles:
+        key = (c.underlying, c.session_date)
+        out[key] = out.get(key, 0.0) + c.cycle_pnl
+    return out
+
+
+def _stdev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+    return var ** 0.5
+
+
+def _print_session_halt_summary(cycles: list[CycleResult], session_cfg: dict) -> None:
+    """Section that quantifies where/how the session-halt fired.
+
+    Rendered only when at least one of the three thresholds is set
+    (otherwise no halts can fire and the section would be empty).
+    """
+    print("\n## Session-halt summary\n")
+    print(f"- lock_trigger: {session_cfg.get('lock_trigger')}")
+    print(f"- trail_drop: {session_cfg.get('trail_drop')}")
+    print(f"- daily_loss_limit: {session_cfg.get('daily_loss_limit')}")
+    print(f"- halt_mode: {session_cfg.get('halt_mode')}\n")
+
+    # A "session-index" is halted if any cycle in it ended with halted=True,
+    # OR if a cycle's exit_reason was one of the halt signals.
+    halt_reasons = {"SESSION_LOCK_TRAIL", "SESSION_LOSS_LIMIT"}
+    halted_keys: set[tuple[str, date]] = set()
+    trail_halts = 0
+    loss_halts = 0
+    for c in cycles:
+        if c.exit_reason in halt_reasons:
+            halted_keys.add((c.underlying, c.session_date))
+            if c.exit_reason == "SESSION_LOCK_TRAIL":
+                trail_halts += 1
+            else:
+                loss_halts += 1
+        elif c.session_halted_after:
+            halted_keys.add((c.underlying, c.session_date))
+
+    # Soft-mode halts close the cycle naturally (no SESSION_* exit_reason
+    # on the halt-triggering cycle), so detect those by finding a sudden
+    # transition to session_halted_after across the day.
+    # For the trail/loss breakdown we inspect the FIRST halting cycle per
+    # key by scanning the cycles in order per (index, date).
+    grouped: dict[tuple[str, date], list[CycleResult]] = {}
+    for c in cycles:
+        grouped.setdefault((c.underlying, c.session_date), []).append(c)
+    for key, day_cycles in grouped.items():
+        day_cycles.sort(key=lambda c: c.cycle_no)
+        if any(c.session_halted_after for c in day_cycles):
+            halted_keys.add(key)
+
+    total_session_days = len(grouped)
+    total_halted = len(halted_keys)
+
+    print(f"- total session-index days: **{total_session_days}**")
+    print(f"- sessions halted: **{total_halted}** "
+          f"({(total_halted / max(1, total_session_days) * 100):.1f}%)")
+    print(f"- SESSION_LOCK_TRAIL exits (hard-mode only): {trail_halts}")
+    print(f"- SESSION_LOSS_LIMIT exits (hard-mode only): {loss_halts}")
+
+    # Compare session-end P&L on halted days vs natural-close days.
+    halted_pnls: list[float] = []
+    natural_pnls: list[float] = []
+    daily = _daily_session_pnl(cycles)
+    for key, pnl in daily.items():
+        if key in halted_keys:
+            halted_pnls.append(pnl)
+        else:
+            natural_pnls.append(pnl)
+    if halted_pnls:
+        print(f"- avg halted-day P&L: {_fmt_inr(sum(halted_pnls) / len(halted_pnls))} "
+              f"(n={len(halted_pnls)})")
+    if natural_pnls:
+        print(f"- avg natural-close day P&L: "
+              f"{_fmt_inr(sum(natural_pnls) / len(natural_pnls))} "
+              f"(n={len(natural_pnls)})")
+
+    if halted_keys:
+        print("\n| Month | Idx | Halted days | Month days | Halt rate |")
+        print("|:--|:--|--:|--:|--:|")
+        monthly: dict[tuple[str, str], tuple[int, int]] = {}
+        for (idx, d) in grouped.keys():
+            ym = d.strftime("%Y-%m")
+            total, halted = monthly.get((ym, idx), (0, 0))
+            total += 1
+            if (idx, d) in halted_keys:
+                halted += 1
+            monthly[(ym, idx)] = (total, halted)
+        for (ym, idx) in sorted(monthly):
+            total, halted = monthly[(ym, idx)]
+            rate = halted / max(1, total) * 100.0
+            print(f"| {ym} | {idx} | {halted} | {total} | {rate:.1f}% |")
+
+
+def _print_consistency_summary(cycles: list[CycleResult]) -> None:
+    """Consistency section: daily-P&L stdev, drawdown, sign distribution.
+
+    "Consistency" is what the user asked about ("MTM went to 5000 and came
+    back to 2310"), so we report on daily session-level P&L across all
+    (index, session) pairs in the run.
+    """
+    print("\n## Consistency\n")
+    daily = _daily_session_pnl(cycles)
+    if not daily:
+        print("_no cycles — nothing to summarise._")
+        return
+
+    pnls = list(daily.values())
+    mean = sum(pnls) / len(pnls)
+    sd = _stdev(pnls)
+    sharpe = (mean / sd) if sd > 0 else 0.0
+
+    print(f"- session-day count (across indices): **{len(pnls)}**")
+    print(f"- mean daily P&L: **{_fmt_inr(mean)}**")
+    print(f"- stdev daily P&L: **{_fmt_inr(sd)}**")
+    print(f"- Sharpe-ish (mean / stdev): **{sharpe:.3f}**")
+    print(f"- max daily peak (best session-day): **{_fmt_inr(max(pnls))}**")
+    print(f"- max daily drawdown (worst session-day): **{_fmt_inr(min(pnls))}**")
+
+    pos = sum(1 for v in pnls if v > 0)
+    zero = sum(1 for v in pnls if v == 0)
+    neg = sum(1 for v in pnls if v < 0)
+    tot = max(1, len(pnls))
+    print(f"- session-day win rate: **{pos/tot*100:.1f}%** "
+          f"({pos} pos, {zero} flat, {neg} neg)")
+
+    # Month-by-month sign distribution (across both indices).
+    print("\n| Month | Pos days | Flat | Neg | Total | Month P&L |")
+    print("|:--|--:|--:|--:|--:|--:|")
+    by_month: dict[str, list[float]] = {}
+    for (idx, d), pnl in daily.items():
+        by_month.setdefault(d.strftime("%Y-%m"), []).append(pnl)
+    for ym in sorted(by_month):
+        vals = by_month[ym]
+        p = sum(1 for v in vals if v > 0)
+        z = sum(1 for v in vals if v == 0)
+        n = sum(1 for v in vals if v < 0)
+        print(f"| {ym} | {p} | {z} | {n} | {len(vals)} | {_fmt_inr(sum(vals))} |")
+
+    # Aggregate daily P&L across both indices (sums the two per-index
+    # P&Ls on the same calendar date). This is closer to "what the book
+    # did that day" — the user's example was a single aggregated session.
+    print("\n### Combined (NIFTY + BANKNIFTY, same calendar day)\n")
+    combined: dict[date, float] = {}
+    for (idx, d), pnl in daily.items():
+        combined[d] = combined.get(d, 0.0) + pnl
+    cvals = list(combined.values())
+    if cvals:
+        cmean = sum(cvals) / len(cvals)
+        csd = _stdev(cvals)
+        csharpe = (cmean / csd) if csd > 0 else 0.0
+        cpos = sum(1 for v in cvals if v > 0)
+        print(f"- calendar-day count: **{len(cvals)}**")
+        print(f"- mean combined day P&L: **{_fmt_inr(cmean)}**")
+        print(f"- stdev combined day P&L: **{_fmt_inr(csd)}**")
+        print(f"- Sharpe-ish (combined): **{csharpe:.3f}**")
+        print(f"- calendar-day win rate: **{cpos/len(cvals)*100:.1f}%**")
+        print(f"- best combined day: **{_fmt_inr(max(cvals))}**")
+        print(f"- worst combined day: **{_fmt_inr(min(cvals))}**")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1132,6 +1505,26 @@ def main() -> int:
     ap.add_argument("--trace-csv", default=None,
                     help="Optional path to write the per-leg trade table "
                          "(captured whenever --trace-day is set) as CSV.")
+    ap.add_argument("--session-lock-trigger", type=float, default=None,
+                    help="Session-level cumulative P&L (Rs) that arms the "
+                         "trailing stop for the rest of the session. "
+                         "Default disabled. Applied per (index, session) "
+                         "day; cross-index P&L is not pooled.")
+    ap.add_argument("--session-trail-drop", type=float, default=None,
+                    help="Once armed, halt trading when the session "
+                         "cumulative P&L drops by this many Rs from its "
+                         "peak. Requires --session-lock-trigger to be set. "
+                         "Default disabled.")
+    ap.add_argument("--session-daily-loss-limit", type=float, default=None,
+                    help="Independent of the trail: halt trading when the "
+                         "session cumulative P&L drops below -X Rs. "
+                         "Default disabled.")
+    ap.add_argument("--session-halt-mode", default="soft",
+                    choices=["soft", "hard"],
+                    help="soft = halt blocks new cycles but lets the "
+                         "active cycle finish naturally. hard = also "
+                         "force-close the active cycle at the next bar "
+                         "close when the halt fires. Default soft.")
     ap.add_argument("--data-fan", type=int, default=6,
                     help="Cap the loaded cache to offset files with |offset| "
                          "<= N, so the per-strike fixed frame only contains "
@@ -1211,27 +1604,27 @@ def main() -> int:
     # sweep is a single value (trace across a sweep is meaningless).
     trace_legs: list[LegTrade] = []
 
+    # Session-lock-trail config from CLI.
+    session_cfg = {
+        "lock_trigger": args.session_lock_trigger,
+        "trail_drop": args.session_trail_drop,
+        "daily_loss_limit": args.session_daily_loss_limit,
+        "halt_mode": args.session_halt_mode,
+    }
+
     for slip_bps in slip_values:
         stats = ReplayStats()
-        run_cycles: list[CycleResult] = []
         print(f"\n# === run: leg_sl_slip_bps = {slip_bps} ===", flush=True)
-        for i, session in enumerate(sessions, start=1):
-            legs_sink = (
-                trace_legs if (trace_day is not None and session == trace_day
-                               and len(slip_values) == 1) else None
-            )
-            for underlying in indices:
-                run_cycles.extend(
-                    simulate_session(
-                        underlying, session, store, args.fan, stats,
-                        leg_sl_slip_bps=slip_bps,
-                        disable_fixed_strike=args.disable_fixed_strike,
-                        leg_trades_out=legs_sink,
-                    )
-                )
-            if i % 50 == 0 or i == len(sessions):
-                print(f"# progress [{slip_bps}bps]: {i}/{len(sessions)} sessions — "
-                      f"cycles so far: {len(run_cycles)}", flush=True)
+        run_cycles = run_replay(
+            sessions=sessions, indices=indices, store=store, fan=args.fan,
+            leg_sl_slip_bps=slip_bps,
+            disable_fixed_strike=args.disable_fixed_strike,
+            session_cfg=session_cfg,
+            stats=stats,
+            trace_day=trace_day if len(slip_values) == 1 else None,
+            trace_legs_out=trace_legs if len(slip_values) == 1 else None,
+            progress_label=f"{slip_bps}bps",
+        )
 
         if args.csv:
             csv_path = Path(args.csv).expanduser().resolve()
@@ -1248,6 +1641,15 @@ def main() -> int:
         slip_bps, run_cycles, stats = sweep_rows[0]
         print(f"\n_(leg-SL slippage: {slip_bps} bps)_\n")
         _print_report(run_cycles, stats, args.from_date, args.to_date, indices)
+        # Session halt summary — only rendered when at least one halt
+        # threshold is configured (otherwise the gate is a no-op).
+        if any(v is not None for v in (
+            session_cfg["lock_trigger"], session_cfg["trail_drop"],
+            session_cfg["daily_loss_limit"],
+        )):
+            _print_session_halt_summary(run_cycles, session_cfg)
+        # Consistency section — always useful, so print unconditionally.
+        _print_consistency_summary(run_cycles)
     else:
         _print_sweep_report(sweep_rows, args.from_date, args.to_date, indices)
 
