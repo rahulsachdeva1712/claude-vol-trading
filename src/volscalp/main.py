@@ -216,9 +216,20 @@ class RuntimeState:
         }
 
     def snapshot(self) -> dict[str, Any]:
+        orphans: list[dict[str, Any]] = []
+        auto_kill = False
+        if self.reconciler is not None:
+            try:
+                orphans = self.reconciler.orphans
+                auto_kill = self.reconciler.auto_kill_enabled
+            except Exception:  # noqa: BLE001
+                orphans = []
+                auto_kill = False
         return {
             "modes": {m.value: self._tree_snapshot(t) for m, t in self.modes.items()},
             "live_available": self.has_live(),
+            "orphans": orphans,
+            "orphan_auto_kill": auto_kill,
         }
 
     # ---- mutations from dashboard ---------------------------------------

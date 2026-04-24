@@ -156,6 +156,57 @@
     renderLineChart('equity-' + mode, 'equity-chart-' + mode, 'equity-empty-' + mode, labels, data);
   }
 
+  // Orphan positions — Dhan long positions the app isn't tracking.
+  // Rendered into a dedicated strip at the top of the Live pane and
+  // highlighted red so the user can't miss it. Each row has a Kill
+  // button; the header has an auto-kill toggle.
+  function renderOrphans(snap) {
+    const panel = $('orphan-panel');
+    if (!panel) return;
+    const orphans = snap.orphans || [];
+    const toggle = $('orphan-auto-kill');
+    if (toggle) {
+      toggle.checked = !!snap.orphan_auto_kill;
+      toggle.disabled = !snap.live_available;
+    }
+    if (!orphans.length) {
+      panel.classList.add('hidden');
+      return;
+    }
+    panel.classList.remove('hidden');
+    const tbody = document.querySelector('#orphan-table tbody');
+    if (!tbody) return;
+    tbody.innerHTML = orphans.map(o => `
+      <tr>
+        <td>${o.trading_symbol || '—'}</td>
+        <td>${o.security_id}</td>
+        <td>${o.net_qty}</td>
+        <td>${Number(o.buy_avg || 0).toFixed(2)}</td>
+        <td>${Number(o.ltp || 0).toFixed(2)}</td>
+        <td class="${cssPnl(o.unrealized_pnl)}">${fmtPnl(o.unrealized_pnl)}</td>
+        <td>${o.ticks_seen}</td>
+        <td><button class="danger orphan-kill-btn" data-sid="${o.security_id}">Kill</button></td>
+      </tr>
+    `).join('');
+    tbody.querySelectorAll('.orphan-kill-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const sid = parseInt(btn.dataset.sid, 10);
+        if (!confirm('Square off orphan ' + sid + ' at MARKET?')) return;
+        btn.disabled = true;
+        btn.textContent = '…';
+        try {
+          const res = await postJson('/api/orphans/kill', { security_id: sid });
+          const body = await res.json();
+          if (!body.ok) alert('Kill rejected: ' + (body.reason || body.message || 'unknown'));
+        } catch (e) {
+          alert('Kill failed: ' + e);
+        } finally {
+          fetchStatus();
+        }
+      });
+    });
+  }
+
   function renderLiveControls(snap) {
     const liveTree = (snap.modes || {}).live;
     const hasLive = !!snap.live_available;
@@ -195,6 +246,7 @@
     const modes = snap.modes || {};
     MODES.forEach(m => renderTree(m, modes[m]));
     renderLiveControls(snap);
+    renderOrphans(snap);
   }
 
   async function fetchStatus() {
@@ -306,5 +358,27 @@
       await postJson('/api/live/kill/clear');
       fetchStatus();
     });
+
+    const autoKillToggle = $('orphan-auto-kill');
+    if (autoKillToggle) {
+      autoKillToggle.addEventListener('change', async () => {
+        const enabled = autoKillToggle.checked;
+        if (enabled && !confirm(
+          'Turn ON auto-kill? Confirmed orphans (seen for ~3s) will be\n' +
+          'MARKET-SELL\'d automatically after a ~10s grace window.\n\n' +
+          'Only turn this on if you are sure no manual Dhan-portal\n' +
+          'positions exist on the same option contracts.'
+        )) {
+          autoKillToggle.checked = false;
+          return;
+        }
+        const res = await postJson('/api/orphans/auto_kill', { enabled });
+        if (!res.ok) {
+          alert('Toggle failed: ' + (await res.text()));
+          autoKillToggle.checked = !enabled;
+        }
+        fetchStatus();
+      });
+    }
   });
 })();

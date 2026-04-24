@@ -591,6 +591,37 @@ process restarts: a crash mid-cycle doesn't orphan positions, and the
 user doesn't need to re-arm to continue managing them (the armed
 check only gates *new* cycle starts — see `_tick_engine`).
 
+**Orphan detector (Dhan → app sweep).** The app→Dhan reconciliation
+above catches divergences the app-tracked legs are *aware* of. The
+inverse sweep catches the blind spot: a Dhan long position that no
+live engine is tracking at all. Every tick, after the leg loop, the
+reconciler computes
+``orphan_sids = {p.securityId for p in positions if p.netQty > 0 and
+p.exchangeSegment in (NSE_FNO, BSE_FNO)} - tracked_sids``
+where ``tracked_sids`` is the union of ``leg.security_id`` across
+every live engine's ``current_cycle.legs`` in state PENDING / ACTIVE
+/ EXITING. A sid must be present in this set for
+``ORPHAN_CONFIRM_TICKS=3`` consecutive polls (~3s) before being
+reported — this filters the natural 1-2 tick race between a BUY
+filling at Dhan and the app calling ``on_fill_ack``. Confirmed
+orphans are:
+
+- Logged once per sid as ``orphan_detected`` (ERROR level)
+- Surfaced on ``/api/status`` as ``orphans: [...]`` and drawn as a
+  red panel at the top of the Live pane with a per-row **Kill**
+  button (manual MARKET SELL via ``POST /api/orphans/kill``)
+- Auto-squared-off IFF the user has flipped the **Auto-kill
+  orphans** toggle on. Auto-kill fires after an additional
+  ``ORPHAN_AUTOKILL_GRACE_TICKS=10`` ticks (~10s past confirmation)
+  and rate-limits re-attempts to once per 5s per sid. Toggle
+  starts OFF by default — a mis-detected orphan on a legitimate
+  manual Dhan-app position would auto-close it, so opting in is
+  the user's call. ``POST /api/orphans/auto_kill`` sets the flag.
+
+An orphan that disappears from a subsequent poll (user closed it,
+or the app finally caught up via a late ``on_fill_ack``) is removed
+from the list and logged as ``orphan_resolved``.
+
 **Cycle-close atomicity (`_maybe_finalize_cycle`).** The cycle row in
 SQLite is closed (`update_cycle_close`, counters incremented,
 broadcast fired) **only** when every leg reaches a terminal status

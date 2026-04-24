@@ -160,6 +160,41 @@ def create_app(state) -> FastAPI:
         await state.clear_kill_switch()
         return {"killed": False}
 
+    @app.post("/api/orphans/kill")
+    async def orphan_kill(req: Request) -> dict[str, Any]:
+        """Square off a single orphan Dhan position by securityId.
+        Body: ``{"security_id": int}``. Only touches positions the
+        reconciler has classified as orphans (FRD §8.2).
+        """
+        body = await req.json() if req.headers.get("content-length") else {}
+        try:
+            sid = int(body.get("security_id", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "security_id must be an int") from None
+        if not sid:
+            raise HTTPException(400, "security_id required")
+        if state.reconciler is None:
+            raise HTTPException(400, "reconciler not available (live mode disabled)")
+        result = await state.reconciler.kill_orphan(sid)
+        if not result.get("ok"):
+            # Return 200 with ok:false so the dashboard can show the
+            # reason (e.g. 'not_an_orphan') without a network error.
+            pass
+        return result
+
+    @app.post("/api/orphans/auto_kill")
+    async def orphan_auto_kill(req: Request) -> dict[str, Any]:
+        """Toggle the reconciler's auto-kill mode.
+        Body: ``{"enabled": bool}``. When on, confirmed orphans that
+        persist past the grace window (~13s) are auto-SELL'd at MARKET.
+        """
+        body = await req.json() if req.headers.get("content-length") else {}
+        enabled = bool(body.get("enabled", False))
+        if state.reconciler is None:
+            raise HTTPException(400, "reconciler not available (live mode disabled)")
+        state.reconciler.set_auto_kill(enabled)
+        return {"enabled": state.reconciler.auto_kill_enabled}
+
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()

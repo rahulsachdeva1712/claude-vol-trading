@@ -91,6 +91,28 @@
         (<code>DHAN_CLIENT_ID</code> + <code>DHAN_ACCESS_TOKEN</code>).
       </div>
 
+      <!-- Orphan positions strip — only rendered when the reconciler
+           reports Dhan long positions not tracked by any engine cycle. -->
+      <section id="orphan-panel" class="card orphan-panel hidden">
+        <div class="orphan-header">
+          <h2>Orphan positions <small>(at Dhan, not tracked by the app)</small></h2>
+          <label class="auto-kill-toggle">
+            <input id="orphan-auto-kill" type="checkbox" />
+            <span>Auto-kill orphans</span>
+          </label>
+        </div>
+        <table id="orphan-table">
+          <thead>
+            <tr>
+              <th>Symbol</th><th>sid</th><th>Net qty</th>
+              <th>Buy avg</th><th>LTP</th><th>Unrealized</th>
+              <th>Seen (ticks)</th><th>Action</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
       <section class="kpis" id="kpis-live"></section>
 
       <section class="grid">

@@ -27,13 +27,29 @@ confirms them against the broker. See FRD §5.1 / §5.4 / §8.2.
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
 from typing import Any
 
 from ..broker.dhan_client import DhanClient
 from ..logging_setup import get_logger
-from ..models import LegStatus
+from ..models import LegStatus, OrderRequest
 
 log = get_logger(__name__)
+
+# Orphan is only flagged after it's been present for this many consecutive
+# polls. At 1Hz this ~= 3s — enough to filter out the 1-2 tick window
+# between an app-issued BUY filling at Dhan and the app-side reconciler
+# calling on_fill_ack (during which the securityId legitimately appears
+# in /positions before the engine's leg.security_id is set).
+ORPHAN_CONFIRM_TICKS = 3
+
+# Auto-kill: after this many consecutive ticks of continuous detection
+# (post-confirm), the reconciler places a MARKET SELL for the net qty.
+# Gives the user ~10s at 1Hz to see the orphan on the dashboard and
+# intervene before auto-close fires. Only applies when the auto-kill
+# toggle is on.
+ORPHAN_AUTOKILL_GRACE_TICKS = 10
 
 
 def _as_int(v: Any) -> int:
@@ -64,6 +80,14 @@ class PositionReconciler:
         self.interval_s = max(0.5, interval_s)
         self._last_snapshot: list[dict[str, Any]] = []
         self._stop = asyncio.Event()
+        # Orphan tracking: sid -> dict with the row from Dhan plus our
+        # running `ticks_seen` counter. See `_detect_orphans`.
+        self._orphans: dict[int, dict[str, Any]] = {}
+        self._auto_kill_enabled: bool = False
+        # sid -> timestamp of last auto-kill attempt. Guards against
+        # hammering Dhan with repeated SELLs if the first attempt hung
+        # at PENDING (can legitimately happen for a few seconds).
+        self._autokill_last_attempt: dict[int, float] = {}
 
     def register_engine(self, engine) -> None:
         """Add a live engine after construction (main wires these post-build)."""
@@ -76,6 +100,116 @@ class PositionReconciler:
     @property
     def last_snapshot(self) -> list[dict[str, Any]]:
         return list(self._last_snapshot)
+
+    # ---- orphan detector (public surface) -----------------------------
+
+    @property
+    def auto_kill_enabled(self) -> bool:
+        return self._auto_kill_enabled
+
+    def set_auto_kill(self, enabled: bool) -> None:
+        """Toggle automatic squaring-off of orphan positions.
+
+        When on, orphans that have been confirmed (>= ``ORPHAN_CONFIRM_TICKS``)
+        and persisted for a further ``ORPHAN_AUTOKILL_GRACE_TICKS`` ticks
+        are auto-SELL'd at MARKET. Starts OFF by default to prevent a
+        mis-detection from accidentally closing a legitimate manual
+        position the user placed from the Dhan portal.
+        """
+        if self._auto_kill_enabled == bool(enabled):
+            return
+        self._auto_kill_enabled = bool(enabled)
+        log.warning("orphan_auto_kill_toggled", enabled=self._auto_kill_enabled)
+
+    @property
+    def orphans(self) -> list[dict[str, Any]]:
+        """Confirmed orphans (Dhan long positions not tracked by any
+        live engine). Dashboard reads this; each entry is JSON-safe.
+        """
+        out = []
+        for sid, row in self._orphans.items():
+            if int(row.get("ticks_seen", 0)) < ORPHAN_CONFIRM_TICKS:
+                continue
+            out.append({
+                "security_id": sid,
+                "trading_symbol": row.get("tradingSymbol", ""),
+                "exchange_segment": row.get("exchangeSegment", ""),
+                "net_qty": int(row.get("netQty", 0)),
+                "buy_avg": round(float(row.get("buyAvg", 0.0)), 2),
+                "ltp": round(float(row.get("lastTradedPrice", 0.0)), 2),
+                "unrealized_pnl": round(float(row.get("unrealizedProfit", 0.0)), 2),
+                "ticks_seen": int(row.get("ticks_seen", 0)),
+            })
+        return out
+
+    async def kill_orphan(self, security_id: int) -> dict[str, Any]:
+        """Square off a specific orphan via MARKET SELL. Returns a
+        status dict the API can surface to the dashboard.
+        """
+        sid = int(security_id)
+        row = self._orphans.get(sid)
+        if not row:
+            return {"ok": False, "reason": "not_an_orphan", "security_id": sid}
+        qty = int(row.get("netQty", 0))
+        if qty <= 0:
+            return {"ok": False, "reason": "zero_qty", "security_id": sid}
+        return await self._place_orphan_sell(row, manual=True)
+
+    async def _place_orphan_sell(
+        self, row: dict[str, Any], *, manual: bool,
+    ) -> dict[str, Any]:
+        """Issue a MARKET SELL for the full net_qty of an orphan position.
+
+        Returns {ok, status, broker_order_id?, reason?}. The next
+        reconciler tick will pick up the resulting fill via the normal
+        /positions diff and drop the sid from ``self._orphans``.
+        """
+        sid = int(row["securityId"])
+        qty = int(row["netQty"])
+        tsym = str(row.get("tradingSymbol", ""))
+        seg = str(row.get("exchangeSegment", "NSE_FNO"))
+        client_order_id = f"orphan-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+        req = OrderRequest(
+            client_order_id=client_order_id,
+            security_id=sid,
+            exchange_segment=seg,
+            trading_symbol=tsym,
+            side="SELL",
+            quantity=qty,
+            tag="orphan-kill",
+        )
+        self._autokill_last_attempt[sid] = time.time()
+        log.warning(
+            "orphan_sell_attempt",
+            manual=manual,
+            security_id=sid,
+            trading_symbol=tsym,
+            net_qty=qty,
+            client_order_id=client_order_id,
+        )
+        try:
+            report = await self.client.place_order(req)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "orphan_sell_failed",
+                security_id=sid, trading_symbol=tsym, error=str(exc),
+            )
+            return {"ok": False, "reason": f"place_order_error: {exc}", "security_id": sid}
+        log.warning(
+            "orphan_sell_result",
+            security_id=sid, trading_symbol=tsym,
+            status=report.status, broker_order_id=report.broker_order_id,
+            message=report.message,
+        )
+        return {
+            "ok": report.status in ("PENDING", "OPEN", "FILLED"),
+            "status": report.status,
+            "broker_order_id": report.broker_order_id,
+            "message": report.message,
+            "security_id": sid,
+            "trading_symbol": tsym,
+            "quantity": qty,
+        }
 
     async def run(self) -> None:
         log.info(
@@ -312,3 +446,131 @@ class PositionReconciler:
                                 tag=engine.tag, slot=leg.slot,
                                 error=str(exc),
                             )
+
+        # Orphan sweep — runs every tick AFTER the app→Dhan
+        # reconciliation above so the tracked-sid set reflects any
+        # promotions (PENDING→ACTIVE) that just happened this tick.
+        await self._detect_orphans(positions)
+
+    # ------------------------------------------------------------------
+    # Orphan detector (Dhan → app direction)
+    # ------------------------------------------------------------------
+
+    def _tracked_security_ids(self) -> set[int]:
+        """All securityIds currently managed by any live engine's cycle.
+
+        Includes legs in any non-terminal state (PENDING, ACTIVE,
+        EXITING) — STOPPED / EMPTY legs are excluded because their
+        position at Dhan should be gone already.
+        """
+        sids: set[int] = set()
+        for engine in self.live_engines:
+            cycle = getattr(engine, "current_cycle", None)
+            if not cycle:
+                continue
+            for leg in cycle.legs.values():
+                if not leg.security_id:
+                    continue
+                if leg.status in (
+                    LegStatus.PENDING, LegStatus.ACTIVE, LegStatus.EXITING,
+                ):
+                    sids.add(int(leg.security_id))
+        return sids
+
+    async def _detect_orphans(self, positions: list[dict[str, Any]]) -> None:
+        """Flag Dhan long positions that no live engine is tracking.
+
+        Scans /positions for rows with ``netQty > 0`` on an options
+        F&O segment (NSE_FNO / BSE_FNO) whose ``securityId`` is not in
+        ``_tracked_security_ids()``. Each orphan needs to be seen for
+        ``ORPHAN_CONFIRM_TICKS`` consecutive polls before being reported
+        (filters the 1-2 tick race between Dhan confirming a BUY and
+        the engine calling ``on_fill_ack``).
+
+        If ``auto_kill_enabled`` is on, orphans that persist past
+        ``ORPHAN_AUTOKILL_GRACE_TICKS`` after confirmation are auto
+        SELL'd at MARKET.
+        """
+        tracked = self._tracked_security_ids()
+        current_orphan_sids: set[int] = set()
+
+        for p in positions:
+            sid = _as_int(p.get("securityId"))
+            if not sid:
+                continue
+            seg = str(p.get("exchangeSegment", "") or "")
+            if seg not in ("NSE_FNO", "BSE_FNO"):
+                continue
+            net_qty = _as_int(p.get("netQty"))
+            if net_qty <= 0:
+                continue
+            if sid in tracked:
+                continue
+            current_orphan_sids.add(sid)
+            existing = self._orphans.get(sid)
+            if existing is None:
+                self._orphans[sid] = {
+                    "securityId": sid,
+                    "tradingSymbol": p.get("tradingSymbol", ""),
+                    "exchangeSegment": seg,
+                    "netQty": net_qty,
+                    "buyAvg": _as_float(p.get("buyAvg")),
+                    "lastTradedPrice": _as_float(p.get("lastTradedPrice")),
+                    "unrealizedProfit": _as_float(p.get("unrealizedProfit")),
+                    "ticks_seen": 1,
+                    "first_seen": time.time(),
+                }
+                continue
+            existing["ticks_seen"] = int(existing.get("ticks_seen", 0)) + 1
+            # Refresh the volatile fields (LTP, unrealized) but keep
+            # the identity + first_seen.
+            existing["tradingSymbol"] = p.get("tradingSymbol", existing.get("tradingSymbol", ""))
+            existing["netQty"] = net_qty
+            existing["buyAvg"] = _as_float(p.get("buyAvg"))
+            existing["lastTradedPrice"] = _as_float(p.get("lastTradedPrice"))
+            existing["unrealizedProfit"] = _as_float(p.get("unrealizedProfit"))
+            # Log once per sid at the moment of confirmation.
+            if existing["ticks_seen"] == ORPHAN_CONFIRM_TICKS:
+                log.error(
+                    "orphan_detected",
+                    security_id=sid,
+                    trading_symbol=existing["tradingSymbol"],
+                    net_qty=net_qty,
+                    buy_avg=existing["buyAvg"],
+                    unrealized_pnl=existing["unrealizedProfit"],
+                )
+
+        # Drop any orphan that disappeared from this poll (either the
+        # user closed it, or the app finally adopted it via a late
+        # on_fill_ack).
+        for gone in list(self._orphans.keys() - current_orphan_sids):
+            row = self._orphans.pop(gone, None)
+            self._autokill_last_attempt.pop(gone, None)
+            if row and int(row.get("ticks_seen", 0)) >= ORPHAN_CONFIRM_TICKS:
+                log.warning(
+                    "orphan_resolved",
+                    security_id=gone,
+                    trading_symbol=row.get("tradingSymbol", ""),
+                )
+
+        # Auto-kill: confirmed orphans that persist past the grace
+        # window get a MARKET SELL.
+        if not self._auto_kill_enabled:
+            return
+        threshold = ORPHAN_CONFIRM_TICKS + ORPHAN_AUTOKILL_GRACE_TICKS
+        now_ts = time.time()
+        for sid, row in list(self._orphans.items()):
+            if int(row.get("ticks_seen", 0)) < threshold:
+                continue
+            last = self._autokill_last_attempt.get(sid, 0.0)
+            # Don't re-fire within 5s of the previous attempt — Dhan's
+            # SELL might still be PENDING on its side.
+            if now_ts - last < 5.0:
+                continue
+            try:
+                await self._place_orphan_sell(row, manual=False)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "orphan_autokill_failed",
+                    security_id=sid, error=str(exc),
+                )
