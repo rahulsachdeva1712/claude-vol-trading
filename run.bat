@@ -77,6 +77,15 @@ REM ---- launch ----------------------------------------------------------
 echo [volscalp] Starting app ... (Ctrl+C to stop)
 echo [volscalp] Dashboard will be at http://127.0.0.1:8765
 echo.
+
+REM Fire-and-forget: wait ~5 seconds for uvicorn to bind the port, then
+REM open the dashboard in the default browser. Runs in a detached cmd so
+REM the foreground app launch below is unaffected. Skip by setting
+REM VOLSCALP_NO_BROWSER=1 before calling run.bat.
+if not defined VOLSCALP_NO_BROWSER (
+    start "" /B cmd /c "timeout /t 5 /nobreak >nul 2>&1 && start "" http://127.0.0.1:8765"
+)
+
 "%VENV_PY%" -m volscalp --config configs\default.yaml
 
 echo.
