@@ -34,3 +34,10 @@ run/
 .idea/
 *.swp
 .DS_Store
+
+# Claude Code project config (local per-user)
+.claude/
+
+# Ad-hoc developer output (backtest dumps, scratch results)
+out/
+scripts/_*
