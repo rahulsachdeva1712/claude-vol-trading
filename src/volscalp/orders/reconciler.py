@@ -150,10 +150,54 @@ class PositionReconciler:
             existing["netQty"] = existing["netQty"] + net_qty
         return out
 
+    @staticmethod
+    def _broker_realized_by_underlying(
+        positions: list[dict[str, Any]], underlying: str,
+    ) -> float:
+        """Sum ``realizedProfit`` across every Dhan position whose
+        ``tradingSymbol`` is an option on the given underlying.
+
+        Dhan's position rows for this account use symbols like
+        ``NIFTY-Apr2026-24150-CE`` / ``BANKNIFTY-Apr2026-56600-CE`` — a
+        plain ``startswith(f"{underlying}-")`` discriminates NIFTY vs
+        BANKNIFTY cleanly (BANKNIFTY does NOT start with ``NIFTY-``).
+        Equity positions (symbols without the dash prefix) are skipped,
+        as are positions on other F&O segments.
+        """
+        prefix = f"{underlying}-"
+        total = 0.0
+        for p in positions:
+            ts = str(p.get("tradingSymbol", "") or "")
+            if not ts.startswith(prefix):
+                continue
+            seg = str(p.get("exchangeSegment", "") or "")
+            if seg not in ("NSE_FNO", "BSE_FNO"):
+                continue
+            try:
+                total += float(p.get("realizedProfit", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
+
     async def _reconcile(self, positions: list[dict[str, Any]]) -> None:
         if not self.live_engines:
             return
         by_sid = self._index_by_security(positions)
+
+        # Push Dhan's realized-today figure into each live engine so the
+        # KPI strip shows broker truth rather than app-internal cycle
+        # accounting. See FRD §8.2.
+        for engine in self.live_engines:
+            try:
+                total_realized = self._broker_realized_by_underlying(
+                    positions, engine.underlying.value,
+                )
+                engine.set_broker_realized(total_realized)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "broker_realized_update_failed",
+                    tag=getattr(engine, "tag", "?"), error=str(exc),
+                )
 
         for engine in self.live_engines:
             cycle = engine.current_cycle

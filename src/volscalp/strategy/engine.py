@@ -96,6 +96,18 @@ class StrategyEngine:
         self.closed_cycles_count: int = 0
         self.win_count: int = 0
         self.loss_count: int = 0
+        # Dhan-sourced realized P&L for today. Populated by the position
+        # reconciler on every poll by summing `realizedProfit` across
+        # positions matching this engine's underlying. When set, the KPI
+        # strip surfaces Dhan's figure instead of the engine's own
+        # per-cycle accounting — so the "Today Realized P&L" number the
+        # user sees always matches what the broker portal shows. See
+        # FRD §8.2.
+        #
+        # Left at None when the reconciler has never reported (paper
+        # mode, Dhan unreachable, etc.) — in that case the KPI falls back
+        # to the engine's internal ``realized_pnl``.
+        self.broker_realized_today: float | None = None
 
         self._mtm_ctrl: MtmController | None = None
         self._stop = asyncio.Event()
@@ -107,6 +119,18 @@ class StrategyEngine:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def set_broker_realized(self, value: float) -> None:
+        """Called by ``PositionReconciler`` each poll with Dhan's total
+        realized P&L for today across positions matching this engine's
+        underlying. Live-only — paper engines ignore this (paper has no
+        broker truth to defer to)."""
+        if self.mode != Mode.LIVE:
+            return
+        try:
+            self.broker_realized_today = float(value)
+        except (TypeError, ValueError):
+            self.broker_realized_today = 0.0
 
     async def _backfill_counters_from_db(self) -> None:
         """Rehydrate in-memory KPI counters from today's closed cycles.
@@ -1006,8 +1030,20 @@ class StrategyEngine:
         unrealized = 0.0
         if self.current_cycle:
             unrealized = sum(leg.unrealized_pnl for leg in self.current_cycle.legs.values())
-        total = self.realized_pnl + unrealized
-        avg_closed = (self.realized_pnl / self.closed_cycles_count) if self.closed_cycles_count else 0.0
+
+        # For live mode, prefer Dhan's realized P&L whenever the
+        # reconciler has seen a value — that way the "Today Realized
+        # P&L" KPI matches the broker portal exactly (brokerage included,
+        # manual trades included, partial fills handled). Paper mode and
+        # live mode without a broker figure fall back to the engine's
+        # internal per-cycle accounting.
+        if self.mode == Mode.LIVE and self.broker_realized_today is not None:
+            displayed_realized = self.broker_realized_today
+        else:
+            displayed_realized = self.realized_pnl
+
+        total = displayed_realized + unrealized
+        avg_closed = (displayed_realized / self.closed_cycles_count) if self.closed_cycles_count else 0.0
         total_trades = self.win_count + self.loss_count
         win_rate = (self.win_count / total_trades * 100.0) if total_trades else 0.0
         return {
@@ -1016,7 +1052,15 @@ class StrategyEngine:
             "armed": self.armed.is_set(),
             "cycle_no": self.cycle_counter,
             "closed_cycles": self.closed_cycles_count,
-            "realized_pnl": round(self.realized_pnl, 2),
+            "realized_pnl": round(displayed_realized, 2),
+            # Engine's own audit trail — useful when comparing against
+            # Dhan to see exactly how much the broker truth diverges
+            # from the app's internal cycle P&L records.
+            "internal_realized_pnl": round(self.realized_pnl, 2),
+            "broker_realized_pnl": (
+                round(self.broker_realized_today, 2)
+                if self.broker_realized_today is not None else None
+            ),
             "unrealized_pnl": round(unrealized, 2),
             "mtm": round(total, 2),
             "peak_session_pnl": round(self.peak_session_pnl, 2),

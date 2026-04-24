@@ -59,6 +59,14 @@ authoritative specification for the development team.
   broker position disappears without an app-initiated exit (manual
   square-off in the Dhan portal, broker-initiated stop, etc.). Detected
   by the reconciler. See §5.4.
+- **Broker-sourced realized P&L (live)**: The reconciler sums
+  ``realizedProfit`` across all of Dhan's option positions for each
+  engine's underlying on every poll. The KPI strip's "Today Realized
+  P&L" for a live engine surfaces this broker figure — so the number
+  the user sees matches the Dhan portal exactly, including brokerage,
+  partial fills, and any manual trades on the same underlying. The
+  engine's own per-cycle P&L accounting is retained as an audit trail
+  (``internal_realized_pnl`` in the KPI snapshot). See §8.2 and §11.4.
 - **Open-cycle adoption**: On process start, the engine re-hydrates any
   cycle the previous run left open (status PENDING/ACTIVE on disk) so
   positions are managed across restarts rather than orphaned. The
@@ -453,6 +461,18 @@ model into the engines' leg state machines:
   detector (§6.1) then decides whether the cycle itself is over.
 - Paper engines are invisible to the reconciler — `PaperBackend`
   returns FILLED synchronously, so paper legs never sit in PENDING.
+- **Broker-truth realized P&L.** Every poll the reconciler also sums
+  ``realizedProfit`` across Dhan's option positions for each live
+  engine's underlying (`tradingSymbol` prefix match — NIFTY vs
+  BANKNIFTY are disambiguated by the trailing dash) and calls
+  `engine.set_broker_realized(total)`. The engine's `kpi_snapshot()`
+  returns this broker figure as `realized_pnl` for live mode so the
+  KPI strip matches the Dhan portal exactly — inclusive of brokerage,
+  manual trades on the same underlying, and any divergence between
+  the app's recorded exit fills and actual broker fills. The engine's
+  own `self.realized_pnl` (computed from cycle.cycle_pnl) is preserved
+  as `internal_realized_pnl` in the snapshot for audit. Paper engines
+  ignore this call; their KPI always reflects internal accounting.
 
 **Restart-safe open-cycle adoption.** On startup, after the KPI
 backfill (`_backfill_counters_from_db`), each live engine runs
@@ -606,6 +626,14 @@ or `unavailable` (when Dhan credentials are absent).
   times) diverge naturally based on execution reality.
 - Each mode has its own session row in SQLite (`sessions.mode = 'paper'|'live'`)
   for clean audit isolation.
+- **Live realized P&L is broker-sourced, not app-sourced.** The
+  dashboard's "Today Realized P&L" for live engines mirrors Dhan's
+  `/positions` realized total. The engine's own cycle-by-cycle realized
+  accounting remains in SQLite (`cycles.cycle_pnl`) and is exposed as
+  `internal_realized_pnl` alongside for audit — any divergence between
+  the two reveals slippage between recorded bar-close fills and actual
+  broker fills, or manual trades on the same underlying that bypassed
+  the app.
 
 ### 11.5 Security (Live Mode)
 - Dhan credentials never stored in plain text in the repo. Loaded from `.env` (gitignored) or OS keyring.
