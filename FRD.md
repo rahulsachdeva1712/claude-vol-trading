@@ -490,6 +490,15 @@ backfill (`_backfill_counters_from_db`), each live engine runs
 - The reconciler then reconciles each restored leg against Dhan as
   usual: PENDING legs get promoted once the fill acks land; ACTIVE
   legs get EXTERNAL_CLOSE if the position is gone.
+- **Paper-mode restore special case.** Paper engines have no
+  reconciler to bridge PENDING → ACTIVE. A PENDING leg on disk means
+  the prior process crashed between `insert_leg` (status=PENDING,
+  provisional entry) and `update_leg_entry` (status=ACTIVE after the
+  synchronous `PaperBackend` fill), so on restore paper PENDING legs
+  are promoted to ACTIVE in-memory AND in SQLite using the stored
+  entry price — otherwise they would wedge forever (entry never
+  confirms, SL never evaluates, cycle MTM stays 0). Logged as
+  `paper_pending_leg_promoted_on_restore`.
 
 This adoption path is what makes the fill-ack bridge robust across
 process restarts: a crash mid-cycle doesn't orphan positions, and the

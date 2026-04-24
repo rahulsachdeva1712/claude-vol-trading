@@ -258,6 +258,36 @@ class StrategyEngine:
                 entry_order_id=raw["entry_order_id"],
                 row_id=int(raw["leg_row_id"]),
             )
+            # Paper has no async fill bridge — a PENDING leg on disk is
+            # the result of a crash/shutdown between `insert_leg`
+            # (records PENDING + provisional entry price) and
+            # `update_leg_entry` (records ACTIVE after PaperBackend's
+            # synchronous fill). Live can wait for the reconciler to
+            # promote it via on_fill_ack(); paper cannot, so the leg
+            # would be wedged forever (entry never confirms, SL never
+            # evaluates, cycle MTM stays 0). Promote to ACTIVE on
+            # restore using the entry price already persisted — exactly
+            # what the old process was about to do.
+            if self.mode == Mode.PAPER and status == LegStatus.PENDING:
+                leg.status = LegStatus.ACTIVE
+                status = LegStatus.ACTIVE
+                # Persist the promotion so a subsequent restart sees
+                # ACTIVE (otherwise every boot re-runs this path and the
+                # log fills with `paper_pending_leg_promoted_on_restore`
+                # warnings for the same leg).
+                try:
+                    await self.db.update_leg_entry(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "paper_pending_leg_persist_failed",
+                        tag=self.tag, slot=leg.slot, error=str(exc),
+                    )
+                log.warning(
+                    "paper_pending_leg_promoted_on_restore",
+                    tag=self.tag, slot=leg.slot,
+                    security_id=leg.security_id,
+                    entry_price=leg.entry_price,
+                )
             cycle.legs[leg.slot] = leg
             restored_legs += 1
             if status == LegStatus.ACTIVE:
