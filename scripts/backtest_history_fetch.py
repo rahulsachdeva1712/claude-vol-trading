@@ -59,6 +59,23 @@ INDEX_SECURITY_ID = {
 }
 
 
+def _resolve_env_path(repo_root: Path) -> Path:
+    """Resolve which .env file to load. Priority:
+      1. $VOLSCALP_ENV_FILE (absolute or CWD-relative) if set & exists
+      2. ~/Documents/shared/.env (shared across projects, portable via Path.home())
+      3. <repo_root>/.env (legacy fallback)
+    """
+    override = os.getenv("VOLSCALP_ENV_FILE", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+    shared = Path.home() / "Documents" / "shared" / ".env"
+    if shared.is_file():
+        return shared
+    return repo_root / ".env"
+
+
 def _parse_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
@@ -164,11 +181,12 @@ async def main() -> int:
         return 2
 
     repo_root = Path(__file__).resolve().parent.parent
-    load_dotenv(repo_root / ".env")
+    env_path = _resolve_env_path(repo_root)
+    load_dotenv(env_path)
     client_id = os.getenv("DHAN_CLIENT_ID", "")
     token = os.getenv("DHAN_ACCESS_TOKEN", "")
     if not client_id or not token:
-        print("ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in .env")
+        print(f"ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in {env_path}")
         return 2
 
     if args.cache_root:
@@ -206,7 +224,7 @@ async def main() -> int:
             pending_jobs.append(j)
 
     eta_s = int(len(pending_jobs) * args.sleep * 1.1)
-    print(f"# env: {repo_root / '.env'}")
+    print(f"# env: {env_path}")
     print(f"# cache root: {cache_root}")
     print(f"# indices: {indices}")
     print(f"# range: {args.from_date} .. {args.to_date}")

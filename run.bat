@@ -65,11 +65,17 @@ if errorlevel 1 (
 )
 
 REM ---- .env check ------------------------------------------------------
-if not exist ".env" (
-    if exist ".env.example" (
-        echo [volscalp] No .env found. Copying .env.example -> .env
-        copy /Y ".env.example" ".env" >nul
-        echo [volscalp] Edit .env and paste your Dhan DHAN_ACCESS_TOKEN before going LIVE.
+REM The app prefers %USERPROFILE%\Documents\shared\.env (shared across
+REM projects). Only bootstrap a repo-local .env if neither that nor
+REM a repo-local .env already exists.
+if not exist "%USERPROFILE%\Documents\shared\.env" (
+    if not exist ".env" (
+        if exist ".env.example" (
+            echo [volscalp] No .env found ^(shared or local^). Copying .env.example -^> .env
+            copy /Y ".env.example" ".env" >nul
+            echo [volscalp] Edit .env and paste your Dhan DHAN_ACCESS_TOKEN before going LIVE.
+            echo [volscalp] Tip: move your .env to %USERPROFILE%\Documents\shared\.env to share across projects.
+        )
     )
 )
 

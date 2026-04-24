@@ -28,6 +28,24 @@ from dotenv import load_dotenv
 
 DHAN_BASE = "https://api.dhan.co/v2"
 
+
+def _resolve_env_path(repo_root: Path) -> Path:
+    """Resolve which .env file to load. Priority:
+      1. $VOLSCALP_ENV_FILE (absolute or CWD-relative) if set & exists
+      2. ~/Documents/shared/.env (shared across projects, portable via Path.home())
+      3. <repo_root>/.env (legacy fallback)
+    """
+    override = os.getenv("VOLSCALP_ENV_FILE", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+    shared = Path.home() / "Documents" / "shared" / ".env"
+    if shared.is_file():
+        return shared
+    return repo_root / ".env"
+
+
 # Approximate days-back targets the strategy backtest cares about.
 LOOKBACKS = [
     ("T-1d",     1),
@@ -97,11 +115,12 @@ async def _probe(client: httpx.AsyncClient, sec_id: int, segment: str,
 async def main() -> None:
     # Resolve paths from the script's own location so CWD doesn't matter.
     repo_root = Path(__file__).resolve().parent.parent
-    load_dotenv(repo_root / ".env")
+    env_path = _resolve_env_path(repo_root)
+    load_dotenv(env_path)
     client_id = os.getenv("DHAN_CLIENT_ID", "")
     token = os.getenv("DHAN_ACCESS_TOKEN", "")
     if not client_id or not token:
-        print("ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in .env")
+        print(f"ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in {env_path}")
         return
 
     # Locate cached scrip master (today, then walk back a few days).

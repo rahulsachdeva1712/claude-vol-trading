@@ -40,6 +40,23 @@ from dotenv import load_dotenv
 DHAN_BASE = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
 
+
+def _resolve_env_path(repo_root: Path) -> Path:
+    """Resolve which .env file to load. Priority:
+      1. $VOLSCALP_ENV_FILE (absolute or CWD-relative) if set & exists
+      2. ~/Documents/shared/.env (shared across projects, portable via Path.home())
+      3. <repo_root>/.env (legacy fallback)
+    """
+    override = os.getenv("VOLSCALP_ENV_FILE", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+    shared = Path.home() / "Documents" / "shared" / ".env"
+    if shared.is_file():
+        return shared
+    return repo_root / ".env"
+
 # Strategy params (mirror configs/default.yaml).
 MOMENTUM_THRESHOLD_PCT = 1.0
 STRIKE_OFFSET_CE = 6
@@ -591,11 +608,12 @@ async def main() -> None:
     args = ap.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
-    load_dotenv(repo_root / ".env")
+    env_path = _resolve_env_path(repo_root)
+    load_dotenv(env_path)
     client_id = os.getenv("DHAN_CLIENT_ID", "")
     token = os.getenv("DHAN_ACCESS_TOKEN", "")
     if not client_id or not token:
-        print("ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in .env")
+        print(f"ERROR: DHAN_CLIENT_ID / DHAN_ACCESS_TOKEN not set in {env_path}")
         return
 
     data_dir = Path(os.getenv("VOLSCALP_DATA_DIR", "./data"))

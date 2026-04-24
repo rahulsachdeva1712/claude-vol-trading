@@ -6,6 +6,7 @@ in engine.state rather than mutating this object.
 """
 from __future__ import annotations
 
+import os
 from datetime import time as dtime
 from enum import Enum
 from pathlib import Path
@@ -15,6 +16,28 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def resolve_env_path() -> Path:
+    """Return the .env path to load, in priority order:
+
+      1. `$VOLSCALP_ENV_FILE` (absolute or CWD-relative) if set and exists.
+      2. `~/Documents/shared/.env` — shared credentials across projects
+         on this user's machine. Portable because `Path.home()` resolves
+         to the current user's home directory on any OS.
+      3. `./.env` — legacy repo-local fallback. Returned even if the file
+         doesn't exist so downstream behaviour (empty creds) is unchanged
+         for first-time users.
+    """
+    override = os.getenv("VOLSCALP_ENV_FILE", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+    shared = Path.home() / "Documents" / "shared" / ".env"
+    if shared.is_file():
+        return shared
+    return Path(".env")
 
 
 class Mode(str, Enum):
@@ -148,12 +171,13 @@ class EnvSecrets(BaseSettings):
 
 def load_config(path: Path | str = "configs/default.yaml") -> AppConfig:
     """Read YAML + env, return validated AppConfig."""
-    load_dotenv(override=False)
+    env_path = resolve_env_path()
+    load_dotenv(env_path, override=False)
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     cfg = AppConfig.model_validate(raw)
 
-    env = EnvSecrets()
+    env = EnvSecrets(_env_file=str(env_path))
     if env.VOLSCALP_MODE:
         cfg = cfg.model_copy(update={"mode": Mode(env.VOLSCALP_MODE)})
     if env.VOLSCALP_LOG_LEVEL:
@@ -172,5 +196,6 @@ def load_config(path: Path | str = "configs/default.yaml") -> AppConfig:
 
 
 def load_secrets() -> EnvSecrets:
-    load_dotenv(override=False)
-    return EnvSecrets()
+    env_path = resolve_env_path()
+    load_dotenv(env_path, override=False)
+    return EnvSecrets(_env_file=str(env_path))
