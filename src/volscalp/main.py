@@ -466,10 +466,18 @@ async def _run(cfg: AppConfig) -> int:
             except asyncio.TimeoutError:
                 continue
 
-    # Position reconciler — only meaningful for live.
+    # Position reconciler — only meaningful for live. Bridges Dhan's
+    # async fill model (REST returns PENDING, /positions shows fill
+    # moments later) into the engine's leg state machine. See FRD §5.1.
     reconciler_task: asyncio.Task | None = None
     if dhan_client is not None:
-        state.reconciler = PositionReconciler(dhan_client, interval_s=cfg.broker.reconcile_interval_s)
+        live_tree = state.modes.get(Mode.LIVE)
+        live_engines = list(live_tree.engines.values()) if live_tree else []
+        state.reconciler = PositionReconciler(
+            dhan_client,
+            live_engines=live_engines,
+            interval_s=cfg.broker.reconcile_interval_s,
+        )
         reconciler_task = asyncio.create_task(state.reconciler.run(), name="reconciler")
 
     async def cumulative_pnl_refresher() -> None:

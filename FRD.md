@@ -50,6 +50,19 @@ authoritative specification for the development team.
 - **Lock & Trail**: *(removed 2026-04)* Evaluated as a protective profit-floor ratchet on cycle MTM; did not improve P&L vs the plain `max_loss`/`target` pair in the 2y backtest and was stripped from all surfaces. Kept here for glossary completeness only.
 - **Momentum Filter**: Minimum candle return required on the option's own bar before a leg entry is triggered.
 - **Bar**: One OHLCV candle on the options data feed; minimum engine granularity.
+- **Fill-ack bridge**: The reconciler loop that polls Dhan `/positions`
+  and promotes PENDING legs to ACTIVE once the broker confirms the fill.
+  Required because Dhan's REST `/orders` response returns `PENDING` with
+  `tradedQuantity=0` even on successful market orders — the actual fill
+  lands a few hundred milliseconds later in the position book. See §5.1.
+- **EXTERNAL_CLOSE**: Exit reason stamped on an ACTIVE leg when its
+  broker position disappears without an app-initiated exit (manual
+  square-off in the Dhan portal, broker-initiated stop, etc.). Detected
+  by the reconciler. See §5.4.
+- **Open-cycle adoption**: On process start, the engine re-hydrates any
+  cycle the previous run left open (status PENDING/ACTIVE on disk) so
+  positions are managed across restarts rather than orphaned. The
+  reconciler then confirms each leg against the broker. See §8.2.
 
 ---
 
@@ -180,6 +193,24 @@ Maximum 4 active legs at any point within a single cycle.
 - Stop price is fixed at entry and does not change during the leg's life.
 - The stop is evaluated **intrabar on the bar's low by default** (`engine.sl_price_source: low` in `configs/default.yaml`). This matches Codex's `simulate_strategy_day` trigger and the 2y backtest's intrabar check, so backtest, paper, and live all fire stops on the same bar. Configurable to `close` for a more conservative "end-of-bar" simulation.
 - When a leg is stopped, it is exited at the stop price (slippage configurable; default none).
+- **Live fill-ack is asynchronous.** Dhan's REST `POST /orders` returns
+  `orderStatus="PENDING"` with `tradedQuantity=0` even on a successful
+  market order — the actual fill lands in the position book a few
+  hundred milliseconds later. The engine therefore treats the REST
+  response as an order acknowledgment, not a fill:
+  - Leg transitions EMPTY → PENDING the moment `place_order` returns.
+    The provisional `entry_price` / `sl_price` are taken from the
+    triggering bar so the SL gate still has something to compare
+    against on the next bar close.
+  - A separate reconciler loop (§8.2) polls `GET /positions` at 1 Hz.
+    When a row appears for the leg's `securityId` with `buyAvg > 0`
+    and `netQty >= leg.quantity`, the engine's `on_fill_ack()` hook
+    promotes the leg to ACTIVE and **re-computes the SL from the
+    actual fill price** (so a slippage gap on entry doesn't cause a
+    false-positive SL on the next bar).
+  - Paper fills stay synchronous — `PaperBackend` fills immediately at
+    LTP inside the REST call, so the leg goes EMPTY → ACTIVE with no
+    PENDING intermediate and no reconciler involvement.
 - **Per-strike tape after entry.** Once a leg is ACTIVE, it follows the
   entry-captured absolute strike — not the rolling "ATM±N" label (which
   would re-point at a different strike as spot drifts). The strike's
@@ -261,6 +292,16 @@ When multiple exit conditions could apply simultaneously, priority is:
 3. Overall MTM max loss breached (`MTM_MAX_LOSS`) — evaluated on bar close
 4. Overall MTM target reached (`MTM_TARGET`) — evaluated intrabar (1 Hz tick)
 5. Individual leg SL hit (`LEG_SL` — exits only that leg, cycle continues)
+6. External close (`EXTERNAL_CLOSE`) — exits only the observed leg. The
+   reconciler stamps this when an ACTIVE leg's position disappears from
+   Dhan without the app having placed a sell (e.g. the user manually
+   squared off in the portal, or the broker stopped the position). The
+   engine treats this as a terminal leg exit and lets the cycle's
+   cycle-done detector (§6.1) decide whether the cycle itself is over.
+   `EXTERNAL_CLOSE` is out-of-band — it is *observed*, not *triggered*,
+   so it doesn't compete with 3–5 above; it simply records whatever
+   price the broker filled at (`sellAvg` from `/positions`, falling back
+   to last LTP when Dhan hasn't refreshed the row yet).
 
 Priority here is evaluation-cadence-aware: an intrabar target hit at
 09:40:37 fires immediately, even though MAX_LOSS for the same minute
@@ -391,6 +432,49 @@ DB session row.
 Because fills can differ between paper (LTP) and live (Dhan execution),
 the two trees' cycles and P&L naturally diverge over time. This is
 intended — paper is an idealised twin, not a strict mirror.
+
+**Reconciler — live fill-ack bridge.** A single `PositionReconciler`
+task polls Dhan `GET /positions` at 1 Hz (configurable via
+`broker.reconcile_interval_s`) and bridges the broker's async fill
+model into the engines' leg state machines:
+
+- **PENDING → ACTIVE promotion.** A live `place_order` returns
+  `orderStatus="PENDING"` with `tradedQuantity=0` (see §5.1); the leg
+  sits in PENDING until the reconciler sees a position row for the
+  leg's `securityId` with `buyAvg > 0` and `netQty > 0`, then calls
+  `engine.on_fill_ack(security_id, buyAvg, filled_qty)`. The engine
+  promotes the leg to ACTIVE, recomputes SL from the real fill price,
+  and persists the new entry row to SQLite.
+- **EXTERNAL_CLOSE detection.** An ACTIVE leg whose `securityId` is
+  absent from the next poll (or whose row shows `netQty==0` with
+  `sellQty>0`) is treated as closed out-of-band — the reconciler calls
+  `engine.on_external_close(security_id, sellAvg)` and the leg is
+  stamped STOPPED with reason `EXTERNAL_CLOSE` (§5.4). The cycle-done
+  detector (§6.1) then decides whether the cycle itself is over.
+- Paper engines are invisible to the reconciler — `PaperBackend`
+  returns FILLED synchronously, so paper legs never sit in PENDING.
+
+**Restart-safe open-cycle adoption.** On startup, after the KPI
+backfill (`_backfill_counters_from_db`), each live engine runs
+`_restore_open_cycles_from_db`:
+
+- Queries `cycles` + `legs` for today's session-date, this engine's
+  `(mode, underlying)`, with `ended_at IS NULL`.
+- Rebuilds in-memory `Cycle` + `Leg` objects, carrying each leg's
+  persisted `status`, `security_id`, `entry_price`, `sl_price`, and
+  `row_id`. Terminal legs (STOPPED / EMPTY) are skipped — they already
+  closed on disk.
+- Any "ghost" open cycles (more than one open for the same
+  (mode, underlying, date) — shouldn't happen) are force-closed with
+  `SESSION_CLOSE` so the engine doesn't accumulate orphans.
+- The reconciler then reconciles each restored leg against Dhan as
+  usual: PENDING legs get promoted once the fill acks land; ACTIVE
+  legs get EXTERNAL_CLOSE if the position is gone.
+
+This adoption path is what makes the fill-ack bridge robust across
+process restarts: a crash mid-cycle doesn't orphan positions, and the
+user doesn't need to re-arm to continue managing them (the armed
+check only gates *new* cycle starts — see `_tick_engine`).
 
 > Backtesting on historical data is explicitly out of scope (see §1.2).
 
@@ -529,7 +613,15 @@ or `unavailable` (when Dhan credentials are absent).
   before any live entry is placed. Disarm / Kill are immediately effective.
 - Daily loss circuit breaker: not implemented by default (per §12.2 Q1);
   the operator is expected to watch the dashboard and use Kill manually.
-- Only orders placed by this app are tracked by MTM; any manual Dhan trades outside the app are filtered out by order-id tagging.
+- Only orders placed by this app are tracked by MTM. The reconciler
+  matches broker positions to in-flight legs by `securityId` within the
+  app's own `current_cycle.legs` — it never materialises a leg from a
+  position it didn't itself request. A manual Dhan trade outside the app
+  stays invisible to the engine (no PENDING leg to promote → no MTM
+  contribution). The inverse — an ACTIVE leg that the user squares off
+  manually from the portal — is *observed* and stamped `EXTERNAL_CLOSE`
+  (§5.4), so the engine doesn't try to exit a position that is already
+  flat at the broker.
 
 ---
 

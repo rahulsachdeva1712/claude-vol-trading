@@ -148,10 +148,133 @@ class StrategyEngine:
         # process boot.
         self.cycle_counter = int(kpis["max_cycle_no"])
 
+    async def _restore_open_cycles_from_db(self) -> None:
+        """Adopt any cycle left open by a previous process run for this
+        (mode, underlying) on today's date.
+
+        Rebuilds ``self.current_cycle`` + ``self.current_cycle_row_id``
+        from the DB so the strategy can continue managing positions that
+        a prior process left hanging (e.g. crash, ctrl-C while a cycle
+        was live). The reconciler is what eventually transitions each
+        leg from PENDING → ACTIVE once Dhan confirms the fill. See
+        FRD §8.2.
+
+        A cycle only survives here if the DB has it marked open
+        (``ended_at IS NULL``); closed cycles are never replayed.
+        """
+        today_iso = datetime.now(self.tz).date().isoformat()
+        try:
+            open_cycles = await self.db.fetch_open_cycles_with_legs(
+                self.mode.value, self.underlying.value, today_iso,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("open_cycle_restore_failed", tag=self.tag, error=str(exc))
+            return
+
+        if not open_cycles:
+            return
+
+        # If for some reason there are several open cycles for the same
+        # (mode, underlying, date) — there should never be — adopt the
+        # newest and mark the older ones closed with SESSION_CLOSE so we
+        # don't accumulate ghosts on disk.
+        *stale, latest = open_cycles
+        for ghost in stale:
+            log.warning(
+                "stale_open_cycle_found",
+                tag=self.tag, cycle=ghost["cycle_no"], row_id=ghost["cycle_row_id"],
+            )
+            try:
+                await self.db.update_cycle_close(
+                    ghost["cycle_row_id"], ExitReason.SESSION_CLOSE, 0.0, 0.0, 0.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ghost_cycle_close_failed", error=str(exc))
+
+        # Build the in-memory Cycle + Leg graph.
+        cycle = Cycle(
+            cycle_id=int(latest["cycle_no"]),
+            underlying=latest["underlying"],
+            start_ts=now_ns(),   # synthetic — the original start is in DB
+            atm_at_start=int(latest["atm_at_start"]),
+            state=CycleState.WATCHING,
+        )
+        restored_legs = 0
+        any_active = False
+        any_pending = False
+        for raw in latest["legs"]:
+            try:
+                status = LegStatus(raw["status"])
+            except ValueError:
+                status = LegStatus.EMPTY
+            # Skip terminal legs — they already closed on disk and don't
+            # need to be managed again.
+            if status in (LegStatus.STOPPED, LegStatus.EMPTY):
+                continue
+            try:
+                opt_type = OptionType(raw["option_type"])
+                kind = LegKind(raw["kind"])
+            except ValueError:
+                continue
+            leg = Leg(
+                slot=int(raw["slot"]),
+                kind=kind,
+                option_type=opt_type,
+                underlying=raw["underlying"],
+                strike=int(raw["strike"]),
+                security_id=int(raw["security_id"]),
+                trading_symbol=raw["trading_symbol"],
+                expiry=raw["expiry"],
+                lot_size=int(raw["lot_size"]),
+                lots=int(raw["lots"]) if raw["lots"] else 1,
+                status=status,
+                entry_price=float(raw["entry_price"]),
+                sl_price=float(raw["sl_price"]),
+                last_price=float(raw["entry_price"]),
+                entry_order_id=raw["entry_order_id"],
+                row_id=int(raw["leg_row_id"]),
+            )
+            cycle.legs[leg.slot] = leg
+            restored_legs += 1
+            if status == LegStatus.ACTIVE:
+                any_active = True
+                if cycle.state == CycleState.WATCHING:
+                    cycle.state = CycleState.ACTIVE
+            elif status == LegStatus.PENDING:
+                any_pending = True
+
+        if restored_legs == 0:
+            # No manageable legs — close the empty shell so the engine
+            # starts fresh.
+            try:
+                await self.db.update_cycle_close(
+                    int(latest["cycle_row_id"]),
+                    ExitReason.SESSION_CLOSE, 0.0, 0.0, 0.0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("empty_cycle_close_failed", error=str(exc))
+            return
+
+        self.current_cycle = cycle
+        self.current_cycle_row_id = int(latest["cycle_row_id"])
+        self._mtm_ctrl = MtmController(self.profile)
+
+        log.warning(
+            "open_cycle_restored",
+            tag=self.tag,
+            cycle=cycle.cycle_id,
+            row_id=self.current_cycle_row_id,
+            legs=restored_legs,
+            pending=any_pending,
+            active=any_active,
+            atm=cycle.atm_at_start,
+        )
+
     async def run(self) -> None:
         """Engine driver — pumps the cycle state machine on a 1-second tick."""
         self.expiry = self.instruments.pick_expiry(self.underlying, self.cfg.expiry)
         await self._backfill_counters_from_db()
+        await self._restore_open_cycles_from_db()
         log.info(
             "engine_started",
             tag=self.tag,
@@ -161,6 +284,7 @@ class StrategyEngine:
             backfilled_realized_pnl=round(self.realized_pnl, 2),
             backfilled_cycles=self.closed_cycles_count,
             backfilled_cycle_counter=self.cycle_counter,
+            restored_open_cycle=(self.current_cycle.cycle_id if self.current_cycle else None),
         )
 
         while not self._stop.is_set():
@@ -453,12 +577,33 @@ class StrategyEngine:
 
         report = await self.orders.place(req)
         if report.status == "FILLED":
+            # Paper path: PaperBackend fills synchronously at LTP. Live
+            # rarely lands here — Dhan REST almost always returns PENDING
+            # first (see FRD §5.1). If the broker DOES report a fill on
+            # the POST response, adopt it in-band; otherwise the reconciler
+            # will promote the leg via on_fill_ack() when /positions shows
+            # the trade.
             if report.avg_fill_price > 0:
                 leg.entry_price = report.avg_fill_price
                 leg.sl_price = round(report.avg_fill_price * (1 - sl_pct / 100.0), 2)
             leg.status = LegStatus.ACTIVE
             if self.current_cycle and self.current_cycle.state == CycleState.WATCHING:
                 self.current_cycle.state = CycleState.ACTIVE
+            if leg.row_id:
+                try:
+                    await self.db.update_leg_entry(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("leg_entry_db_update_failed", slot=leg.slot, error=str(exc))
+        elif report.status in ("PENDING", "OPEN"):
+            # Live async-fill path: leg stays PENDING; the reconciler
+            # observes Dhan /positions and calls on_fill_ack() once the
+            # fill lands. SL is provisional (computed off the bar close)
+            # until the real fill price arrives — we recompute it then.
+            log.info(
+                "leg_order_pending_fill_ack",
+                tag=self.tag, slot=leg.slot, broker_order_id=report.broker_order_id,
+                provisional_entry=leg.entry_price, provisional_sl=leg.sl_price,
+            )
         elif report.status in ("REJECTED", "FAILED", "CANCELLED"):
             leg.status = LegStatus.EMPTY
             leg.exit_reason = ExitReason.MANUAL
@@ -521,6 +666,130 @@ class StrategyEngine:
              "slot": leg.slot, "status": leg.status.value,
              "exit_price": leg.exit_price, "reason": reason.value, "pnl": leg.realized_pnl},
         )
+
+    # ---- reconciler bridge (live fills) ------------------------------------
+
+    async def on_fill_ack(
+        self, security_id: int, avg_price: float, filled_qty: int,
+    ) -> bool:
+        """Called by the position reconciler when Dhan /positions shows
+        a previously-placed live order has filled.
+
+        Finds the PENDING leg in ``current_cycle`` that matches
+        ``security_id`` and promotes it to ACTIVE using ``avg_price`` as
+        the real fill price, recomputing the stop-loss level from the
+        original per-leg SL pct. Returns True if a leg was promoted.
+
+        Paper fills already arrive FILLED from PaperBackend synchronously,
+        so this hook is a no-op for paper mode.
+        """
+        if self.mode != Mode.LIVE:
+            return False
+        cycle = self.current_cycle
+        if not cycle:
+            return False
+        if avg_price <= 0 or filled_qty <= 0:
+            return False
+        promoted = False
+        for leg in cycle.legs.values():
+            if leg.security_id != security_id:
+                continue
+            if leg.status != LegStatus.PENDING:
+                continue
+            sl_pct = (
+                self.cfg.engine.base_leg_sl_pct
+                if leg.kind == LegKind.BASE
+                else self.cfg.engine.lazy_leg_sl_pct
+            )
+            leg.entry_price = float(avg_price)
+            leg.sl_price = round(avg_price * (1 - sl_pct / 100.0), 2)
+            leg.last_price = float(avg_price)
+            leg.status = LegStatus.ACTIVE
+            if cycle.state == CycleState.WATCHING:
+                cycle.state = CycleState.ACTIVE
+            if leg.row_id:
+                try:
+                    await self.db.update_leg_entry(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "fill_ack_db_update_failed",
+                        slot=leg.slot, error=str(exc),
+                    )
+            log.info(
+                "leg_fill_ack",
+                tag=self.tag,
+                cycle=cycle.cycle_id,
+                slot=leg.slot,
+                security_id=security_id,
+                fill_price=avg_price,
+                filled_qty=filled_qty,
+                sl=leg.sl_price,
+            )
+            await self.bus.broadcast(
+                "leg_update",
+                {"mode": self.mode.value, "underlying": self.underlying.value,
+                 "cycle": cycle.cycle_id, "slot": leg.slot,
+                 "status": leg.status.value,
+                 "entry_price": leg.entry_price, "sl": leg.sl_price},
+            )
+            promoted = True
+        return promoted
+
+    async def on_external_close(
+        self, security_id: int, exit_price: float,
+    ) -> bool:
+        """Called by the reconciler when an ACTIVE leg's position has
+        disappeared from Dhan /positions (manual square-off in the
+        portal, broker-initiated stop, etc.).
+
+        Marks the matching leg STOPPED with reason EXTERNAL_CLOSE using
+        ``exit_price`` (the position's sellAvg; falls back to last_price
+        when Dhan reports 0). Returns True if a leg was closed.
+        """
+        if self.mode != Mode.LIVE:
+            return False
+        cycle = self.current_cycle
+        if not cycle:
+            return False
+        closed = False
+        for leg in list(cycle.legs.values()):
+            if leg.security_id != security_id:
+                continue
+            if leg.status != LegStatus.ACTIVE:
+                continue
+            price = float(exit_price) if exit_price > 0 else (leg.last_price or leg.entry_price)
+            leg.exit_price = price
+            leg.status = LegStatus.STOPPED
+            leg.exit_reason = ExitReason.EXTERNAL_CLOSE
+            leg.exit_bar_ts = int(datetime.now(timezone.utc).timestamp())
+            self.realized_pnl += leg.realized_pnl
+            if leg.row_id:
+                try:
+                    await self.db.update_leg_exit(leg.row_id, leg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "external_close_db_update_failed",
+                        slot=leg.slot, error=str(exc),
+                    )
+            log.warning(
+                "leg_external_close",
+                tag=self.tag,
+                cycle=cycle.cycle_id,
+                slot=leg.slot,
+                security_id=security_id,
+                exit_price=price,
+                pnl=leg.realized_pnl,
+            )
+            await self.bus.broadcast(
+                "leg_update",
+                {"mode": self.mode.value, "underlying": self.underlying.value,
+                 "cycle": cycle.cycle_id, "slot": leg.slot,
+                 "status": leg.status.value, "exit_price": leg.exit_price,
+                 "reason": ExitReason.EXTERNAL_CLOSE.value,
+                 "pnl": leg.realized_pnl},
+            )
+            closed = True
+        return closed
 
     async def _maybe_schedule_lazy_leg(self, stopped: Leg, bar: Bar) -> None:
         """Enter the lazy (opposite-side OTM) leg at the stop-minute bar close.

@@ -139,6 +139,28 @@ class Database:
             )
             await self._conn.commit()
 
+    async def update_leg_entry(self, leg_row_id: int, leg: Leg) -> None:
+        """Patch a leg's entry/status fields after the fill ack lands.
+
+        Unlike `insert_leg` (called at PENDING), this is invoked from the
+        reconciler when a Dhan position shows the order has filled. We
+        overwrite status + entry_price + sl_price + entry_order_id in
+        place so the UI + post-restart recovery both see the correct
+        ACTIVE row. See FRD §5.1 / §8.2.
+        """
+        assert self._conn
+        async with self._lock:
+            await self._conn.execute(
+                """UPDATE legs SET status=?, entry_price=?, sl_price=?,
+                                    entry_order_id=?, entry_ts=COALESCE(entry_ts, ?)
+                   WHERE id=?""",
+                (
+                    leg.status.value, leg.entry_price, leg.sl_price,
+                    leg.entry_order_id, _utcnow_iso(), leg_row_id,
+                ),
+            )
+            await self._conn.commit()
+
     # ---- orders ------------------------------------------------------------
 
     async def record_order_request(
@@ -314,6 +336,81 @@ class Database:
         cols = ["id", "cycle_no", "underlying", "cycle_pnl", "peak_mtm", "trough_mtm",
                 "exit_reason", "started_at", "ended_at", "session_date"]
         return [dict(zip(cols, r)) for r in rows]
+
+    async def fetch_open_cycles_with_legs(
+        self, mode_label: str, underlying: str, today_date: str
+    ) -> list[dict[str, Any]]:
+        """Cycles for this (mode, underlying, date) that the engine never
+        closed — typically because a prior process died or was restarted
+        while a live position was still open.
+
+        Returned shape:
+            [{cycle_row_id, cycle_no, underlying, atm_at_start, started_at,
+              legs: [{leg_row_id, slot, kind, option_type, underlying,
+                      strike, expiry, security_id, trading_symbol, lot_size,
+                      lots, quantity, status, entry_price, sl_price,
+                      entry_order_id}, ...]}, ...]
+
+        The engine calls this on startup (alongside KPI backfill) so it
+        can adopt positions the previous run left open — the reconciler
+        then bridges them from PENDING → ACTIVE once Dhan confirms fills.
+        See FRD §8.2 (restart-safe adoption).
+        """
+        assert self._conn
+        async with self._conn.execute(
+            """SELECT c.id, c.cycle_no, c.underlying, c.atm_at_start, c.started_at
+               FROM cycles c
+               JOIN sessions s ON s.id = c.session_id
+               WHERE s.mode = ? AND c.underlying = ? AND s.session_date = ?
+                     AND c.ended_at IS NULL
+               ORDER BY c.id ASC""",
+            (mode_label, underlying, today_date),
+        ) as cur:
+            cycle_rows = await cur.fetchall()
+
+        out: list[dict[str, Any]] = []
+        for cycle_row_id, cycle_no, und, atm, started_at in cycle_rows:
+            async with self._conn.execute(
+                """SELECT id, slot, kind, option_type, underlying, strike, expiry,
+                          security_id, trading_symbol, lot_size, lots, quantity,
+                          status, entry_price, sl_price, entry_order_id
+                   FROM legs
+                   WHERE cycle_id = ?
+                   ORDER BY slot ASC""",
+                (cycle_row_id,),
+            ) as leg_cur:
+                leg_rows = await leg_cur.fetchall()
+            legs = []
+            for (lid, slot, kind, opt, lund, strike, expiry, sec_id, tsym,
+                 lot_size, lots, qty, status, entry_price, sl_price,
+                 entry_oid) in leg_rows:
+                legs.append({
+                    "leg_row_id": lid,
+                    "slot": int(slot),
+                    "kind": kind,
+                    "option_type": opt,
+                    "underlying": lund,
+                    "strike": int(strike),
+                    "expiry": expiry,
+                    "security_id": int(sec_id) if sec_id is not None else 0,
+                    "trading_symbol": tsym or "",
+                    "lot_size": int(lot_size) if lot_size is not None else 0,
+                    "lots": int(lots) if lots is not None else 1,
+                    "quantity": int(qty) if qty is not None else 0,
+                    "status": status,
+                    "entry_price": float(entry_price) if entry_price is not None else 0.0,
+                    "sl_price": float(sl_price) if sl_price is not None else 0.0,
+                    "entry_order_id": entry_oid or "",
+                })
+            out.append({
+                "cycle_row_id": int(cycle_row_id),
+                "cycle_no": int(cycle_no),
+                "underlying": und,
+                "atm_at_start": int(atm) if atm is not None else 0,
+                "started_at": started_at,
+                "legs": legs,
+            })
+        return out
 
     async def fetch_today_engine_kpis(
         self, mode_label: str, underlying: str, today_date: str

@@ -46,6 +46,11 @@ class ExitReason(str, Enum):
     SESSION_CLOSE = "SESSION_CLOSE"
     KILL_SWITCH = "KILL_SWITCH"
     MANUAL = "MANUAL"
+    # Leg was ACTIVE in the app but the broker position disappeared
+    # (manual square-off in the Dhan portal, broker-initiated stop, etc.).
+    # The reconciler stamps this when it can't find a position that it
+    # previously saw filled. See FRD §5.4.
+    EXTERNAL_CLOSE = "EXTERNAL_CLOSE"
 
 
 # ---------------------------------------------------------------------------
